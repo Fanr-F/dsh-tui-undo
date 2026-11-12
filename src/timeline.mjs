@@ -1,9 +1,10 @@
 /**
  * Pure conversation-timeline helpers.
  *
- * The session log only holds the events that are still visible, so anything
- * that used to be cut away lives in a backup. Every read therefore merges the
- * two sources and reasons about `seq` only; nothing here touches a session.
+ * DSH logs are append-only: an undo hides events from the surface but leaves
+ * them in the log, so these helpers can read one source. Replay copies carry a
+ * new `seq`; `copies` maps it back to the original event that owns the step
+ * snapshot. Nothing here touches a session.
  */
 
 export function isUserMessage(event) {
@@ -12,19 +13,6 @@ export function isUserMessage(event) {
 
 export function isAssistantMessage(event) {
   return event?.type === 'assistant/message';
-}
-
-/** Merge event sources into one ascending, de-duplicated timeline. */
-export function mergeTimeline(...sources) {
-  const bySeq = new Map();
-  for (const source of sources) {
-    for (const event of source ?? []) {
-      if (!event || !Number.isInteger(event.seq)) continue;
-      // Earlier sources win: the live log is authoritative for its own range.
-      if (!bySeq.has(event.seq)) bySeq.set(event.seq, event);
-    }
-  }
-  return [...bySeq.values()].sort((left, right) => left.seq - right.seq);
 }
 
 /** Visible turns the user can undo to, oldest first. */
@@ -99,15 +87,3 @@ export function touchedFiles({ timeline, snapshots, boundarySeq, copies }) {
   return files;
 }
 
-/**
- * Everything the boundary hides: its own turn, following assistant work, and
- * the turns after it. Used to size the backup and to show the confirmation.
- */
-export function hiddenRange(timeline, boundarySeq) {
-  const hidden = timeline.filter((event) => event.seq >= boundarySeq);
-  return {
-    events: hidden,
-    turns: hidden.filter(isUserMessage).length,
-    steps: hidden.filter((event) => event.type === 'step/start').length,
-  };
-}

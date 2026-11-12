@@ -2,9 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   boundaryFor,
-  hiddenRange,
   lastBoundary,
-  mergeTimeline,
   nextBoundary,
   plan,
   touchedFiles,
@@ -64,24 +62,6 @@ test('redo walks the boundary forward, then stops', () => {
   assert.equal(nextBoundary(turns, 1), 3);
   assert.equal(nextBoundary(turns, 3), 5);
   assert.equal(nextBoundary(turns, 5), undefined);
-});
-
-test('the timeline merges the log with the backup that holds the cut events', () => {
-  const log = turns.slice(0, 2);
-  const backup = turns.slice(2);
-  const merged = mergeTimeline(log, backup);
-  assert.deepEqual(merged.map((event) => event.seq), [1, 2, 3, 4, 5, 6]);
-  // A duplicated event resolves to the live log, not the backup.
-  const stale = { ...assistant(2, { start: T2, files: ['z.txt'] }) };
-  assert.equal(mergeTimeline(log, [stale]).find((event) => event.seq === 2).data.snapshot.start, T0);
-});
-
-test('hiddenRange sizes the part of the conversation an undo would cut', () => {
-  const hidden = hiddenRange(turns, 3);
-  assert.deepEqual(hidden.events.map((event) => event.seq), [3, 4, 5, 6]);
-  assert.equal(hidden.turns, 2);
-  assert.equal(hidden.steps, 0);
-  assert.deepEqual(hiddenRange(turns, 1).events.at(0).seq, 1);
 });
 
 test('touchedFiles lists each changed path once, in step order', () => {

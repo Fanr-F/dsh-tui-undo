@@ -1,0 +1,8 @@
+# dsh-tui-undo bundle layer.
+#
+# A profile that lists this bundle gets one row. The row names the installed
+# package (not a relative file) so Node resolution finds it from the profile;
+# `dsh plugin --profile <name> add <path-to-this-package>` installs and lists it.
+- insert:
+    - id: dsh-tui-undo
+      name: dsh-tui-undo

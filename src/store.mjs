@@ -1,7 +1,7 @@
-import { createHash, randomUUID } from 'node:crypto';
-import { mkdir, open, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
+import { mkdir, open, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
-import { backupDirectory, backupPath, sessionStatePath } from './paths.mjs';
+import { sessionStatePath } from './paths.mjs';
 
 export const SCHEMA = 1;
 
@@ -66,11 +66,6 @@ export function validateState(value, sessionId) {
       }
     }
   }
-  if (value.backup !== undefined) {
-    if (!value.backup || typeof value.backup.id !== 'string' || !Number.isInteger(value.backup.cutSeq)) {
-      throw new StateError('rewind state has an invalid backup reference');
-    }
-  }
   if (value.copies !== undefined) {
     if (!value.copies || typeof value.copies !== 'object') throw new StateError('rewind state has invalid copies');
     for (const [seq, origin] of Object.entries(value.copies)) {
@@ -105,54 +100,6 @@ export async function writeState(root, state) {
   validateState(next, next.sessionId);
   await atomicJson(sessionStatePath(root, next.sessionId), next);
   return next;
-}
-
-export function backupChecksum(payload) {
-  return createHash('sha256')
-    .update(JSON.stringify({ sessionId: payload.sessionId, cutSeq: payload.cutSeq, header: payload.header, events: payload.events }))
-    .digest('hex');
-}
-
-export async function writeBackup(root, { sessionId, cutSeq, events, header }) {
-  const id = randomUUID();
-  const payload = { id, sessionId, cutSeq, events, header, createdAt: Date.now() };
-  const record = { ...payload, checksum: backupChecksum(payload) };
-  await mkdir(backupDirectory(root, sessionId), { recursive: true, mode: 0o700 });
-  await atomicJson(backupPath(root, sessionId, cutSeq, id), record);
-  return record;
-}
-
-export async function readBackup(root, sessionId, { id, cutSeq }) {
-  const path = backupPath(root, sessionId, cutSeq, id);
-  let text;
-  try {
-    text = await readFile(path, 'utf8');
-  } catch (error) {
-    throw new StateError(`rewind backup ${id} is missing`, error);
-  }
-  let record;
-  try {
-    record = JSON.parse(text);
-  } catch (error) {
-    throw new StateError(`rewind backup ${id} is not valid JSON`, error);
-  }
-  if (record.checksum !== backupChecksum(record)) {
-    throw new StateError(`rewind backup ${id} is corrupt`);
-  }
-  return record;
-}
-
-export async function deleteBackup(root, sessionId, { id, cutSeq }) {
-  await rm(backupPath(root, sessionId, cutSeq, id), { force: true });
-}
-
-export async function listBackups(root, sessionId) {
-  try {
-    return (await readdir(backupDirectory(root, sessionId))).filter((name) => name.endsWith('.json')).sort();
-  } catch (error) {
-    if (error.code === 'ENOENT') return [];
-    throw error;
-  }
 }
 
 async function atomicJson(path, value) {

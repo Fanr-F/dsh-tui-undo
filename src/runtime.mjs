@@ -104,7 +104,6 @@ export class RewindRuntime {
     return {
       cwd: context.cwd,
       revert: state.revert ?? null,
-      backup: state.backup ?? null,
       snapshots: Object.keys(state.snapshots).length,
       pending: this.#pending.has(session.id),
       redoAvailable: Boolean(state.revert),

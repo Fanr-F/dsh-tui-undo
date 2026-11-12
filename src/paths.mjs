@@ -18,14 +18,6 @@ export function sessionStatePath(root, sessionId) {
   return join(root, 'sessions', `${sessionKey(sessionId)}.json`);
 }
 
-export function backupDirectory(root, sessionId) {
-  return join(root, 'backups', sessionKey(sessionId));
-}
-
-export function backupPath(root, sessionId, cutSeq, id) {
-  return join(backupDirectory(root, sessionId), `${cutSeq}-${id}.json`);
-}
-
 export function lockPath(root) {
   return join(root, 'locks', 'workspace.lock');
 }

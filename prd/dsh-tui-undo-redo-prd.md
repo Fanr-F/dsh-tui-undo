@@ -663,7 +663,7 @@ commit():
 | 8 | redo 副本沿用原件 `message.id` / tool-call id，客户端若按 id 建 key 会把两轮折叠 | `src/replay.mjs`：每条消息换新 id，assistant 的 tool-call、stream 与 tool/result 同步重映射 |
 | 9 | compaction 改写 surface 后，按旧边界重放会落到错误位置 | undo 记录 `replaceGeneration/contentGeneration`；redo 前不一致就拒绝（“对话已被压缩或改写”） |
 
-测试：`node --test --test-isolation=none test/*.test.mjs` → **75 pass / 0 fail**；
+测试：`node --test --test-isolation=none test/*.test.mjs` → **72 pass / 0 fail**；
 `node scripts/verify-host.mjs` → **9/9 PASS**（真机 rc.2）。
 
 仍然存在的风险与下一步：
@@ -676,5 +676,41 @@ commit():
    安装/准入会判为 undeclared；这是打包层工作，不影响宿主语义。
 4. `workingDirectory` 服务名与 `get(session)` 已核实无误；`tuiDialogs.select/confirm`
    的调用方式与 dsh-tui 0.19 一致。
-5. v4 遗留的 backup 读写与 `mergeTimeline` 已无调用者，建议后续清理。
+5. v4 遗留已清理：`store.mjs` 的 backup 读写、`paths.mjs` 的 backup 路径、
+   `timeline.mjs` 的 `mergeTimeline/hiddenRange` 及其测试均已删除；`state.backup` 字段不再读取。
+
+### 21.7 打包与安装（v5）
+
+插件现在有两条加载路径：
+
+| 用途 | 文件 | 用法 |
+| --- | --- | --- |
+| 开发期直接跑源码 | `examples/tui-local.cordis.yml` | `dsh tui --patch ./examples/tui-local.cordis.yml`（插入行用相对路径 `./src/index.mjs`，按 patch 文件所在目录解析） |
+| 作为 bundle 安装 | `package.json` 的 `dsh.bundle.patch` + `cordis.patch.yml` | `dsh plugin --profile <name> add <本目录>`；profile 的 bundles 列表追加 `dsh-tui-undo` |
+
+`cordis.patch.yml` 只有一行 `insert`（id `dsh-tui-undo`，name `dsh-tui-undo`），由 Node 从 profile 解析到已安装包。
+
+实测（临时 `DSH_HOME`，避免污染用户 profile）：
+
+```text
+dsh plugin --profile undo-demo add d:\Code\dsh-tui-undo
+  → dependencies: dsh-tui-undo <- ../../../..
+  → bundles: [@deepseek-ai/dsh-base, dsh-tui-undo]
+
+dsh --profile undo-demo --dump-config
+  → # == dsh-tui-undo
+    - id: dsh-tui-undo
+      name: dsh-tui-undo
+```
+
+`require.resolve('dsh-tui-undo', { paths: [profile] })` 解析到本仓库 `src/index.mjs`；
+入口导出 `name/apply/install` 正常。
+
+尚未完成：
+
+1. dsh-tui 自带的 `/plugin install` 走 `dsh-plugin.json`（`@dsh-std/manifest` v0.15）准入，
+   与核心 bundle 安装是两条线；要进插件市场才需要补该声明。
+2. 真实 TUI 交互冒烟（`dsh tui --patch ./examples/tui-local.cordis.yml`）仍需人工跑一次。
+3. `pnpm` 安装时会用到用户级 store 锁（`%LOCALAPPDATA%\pnpm-store-operation-locks`），
+   在 DSH 的 workspace-write 沙箱下需要 `danger-full-access` 才能安装；测试时已授权执行。
 

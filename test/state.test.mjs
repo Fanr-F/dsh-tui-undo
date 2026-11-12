@@ -1,21 +1,17 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import {
   StateError,
   acquireLock,
   createState,
-  deleteBackup,
-  listBackups,
-  readBackup,
   readState,
   validateState,
-  writeBackup,
   writeState,
 } from '../src/store.mjs';
-import { sessionStatePath, backupPath } from '../src/paths.mjs';
+import { sessionStatePath } from '../src/paths.mjs';
 
 async function store(t) {
   const root = join(process.cwd(), '.tmp', 'store', randomUUID());
@@ -49,30 +45,6 @@ test('invalid state is rejected instead of silently repaired', async (t) => {
   await mkdir(join(path, '..'), { recursive: true });
   await writeFile(path, '{not json');
   await assert.rejects(() => readState(root, 'broken'), /not valid JSON/);
-});
-
-test('backups are checksummed, listable and deletable', async (t) => {
-  const root = await store(t);
-  const record = await writeBackup(root, {
-    sessionId: 'session-a',
-    cutSeq: 7,
-    header: { cwd: 'D:/work' },
-    events: [{ seq: 7, type: 'user/message' }, { seq: 8, type: 'assistant/message' }],
-  });
-  assert.match(record.id, /^[0-9a-f-]{36}$/);
-  assert.deepEqual(await listBackups(root, 'session-a'), [`7-${record.id}.json`]);
-
-  const loaded = await readBackup(root, 'session-a', record);
-  assert.deepEqual(loaded.events, record.events);
-
-  const path = backupPath(root, 'session-a', 7, record.id);
-  const tampered = JSON.parse(await readFile(path, 'utf8'));
-  tampered.events.push({ seq: 9, type: 'user/message' });
-  await writeFile(path, JSON.stringify(tampered));
-  await assert.rejects(() => readBackup(root, 'session-a', record), /corrupt/);
-
-  await deleteBackup(root, 'session-a', record);
-  assert.deepEqual(await listBackups(root, 'session-a'), []);
 });
 
 test('the workspace lock excludes a second session and reclaims stale locks', async (t) => {

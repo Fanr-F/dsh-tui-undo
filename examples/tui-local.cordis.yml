@@ -1,0 +1,9 @@
+# Development overlay: load the plugin straight from this checkout.
+#
+#   dsh tui --patch ./examples/tui-local.cordis.yml
+#
+# Relative plugin names in an inserted row resolve beside the patch file, so no
+# install or build step is needed while iterating on src/.
+- insert:
+    - id: dsh-tui-undo-local
+      name: ./src/index.mjs

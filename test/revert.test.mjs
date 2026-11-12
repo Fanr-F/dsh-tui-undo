@@ -4,7 +4,7 @@ import { mkdir, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { RevertService } from '../src/revert.mjs';
-import { createState, listBackups, readState, writeState } from '../src/store.mjs';
+import { createState, readState, writeState } from '../src/store.mjs';
 import { surfaceNodes } from '../src/surface.mjs';
 import { FakeSession, MemorySnapshot, seedThreeTurns, surfacePort } from './fake-session.mjs';
 
@@ -36,9 +36,7 @@ test('undo hides the tail on the surface and restores files to the boundary', as
   // b.txt was created before the boundary, so undoing m3 keeps it.
   assert.equal(snapshot.current.get('b.txt'), 'b1');
   assert.equal(result.hidden.turns, 1);
-  // Nothing is deleted from the append-only log; no v4 backup either.
   assert.equal(session.log.filter((event) => event.type === 'user/message').length, 3);
-  assert.deepEqual(await listBackups(root, 'session-1'), []);
 
   const state = await readState(root, 'session-1');
   assert.equal(state.revert.seq, m3);
