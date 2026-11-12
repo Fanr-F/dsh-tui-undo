@@ -345,20 +345,20 @@ redo():        next = 边界之后的第一条用户消息
 
 | 命令 | 行为 |
 | --- | --- |
-| `/undo` | 打开 picker（复用现有 rewind picker 的样式/分页），确认后 `stage` |
-| `/redo` | 若存在可前移的边界则 `stage(next)`，否则 `clear` |
+| `/undo` | 只弹一次 picker；选中目标立即执行（有 git 就同时回退文件和对话，没有 git 只回退对话） |
+| `/redo` | 若存在可前移的边界则 `stage(next)`，否则 `clear`；执行前一次确认 |
 | `/rewind` | 交给 dsh-tui 原有实现 |
 
-### 8.2 确认面板
+### 8.2 选择面板
 
 ```text
-回退到「<消息摘要>」
-对话：将隐藏 N 条消息（可重做）
-文件：M 个文件，+x −y
-未覆盖：k 项
-冲突：j 项（跳过 / 强制覆盖）
-[仅对话] [对话+文件]
+回退到哪条消息之前？
+> 这条消息的文本
+  隐藏 N 轮 · M 条消息
 ```
+
+选中即回退，不再追问“仅对话/对话+文件”，也不再加确认页。文件是否回退由 git 能力决定：
+找不到 `git` 时自动退化为仅对话，并在结果里注明“未找到 git，文件未改动”。
 
 ### 8.3 输入框回填
 
@@ -541,7 +541,7 @@ web client 可作为增强：投影适配器按 `revert.seq` 过滤（其实事�
 | `src/revert.mjs` | `undo/redo/clear/commit/preview/targets`，端口注入，可脱离宿主测试 |
 | `src/runtime.mjs` | 宿主无关编排：pre-step 采集、assistant 消息记账、发送前提交、撤销请求 |
 | `src/host.mjs` | 宿主端口：`fromRestore` + `create` + `flush`，带宽限期与"事件数必须守恒"校验 |
-| `src/commands.mjs` | `/undo` `/redo` 的命令面板：选择目标 → 选择范围 → 确认 → 执行 |
+| `src/commands.mjs` | `/undo` `/redo` 的命令面板：`/undo` 选目标即执行；`/redo` 一次确认 |
 | `src/index.mjs` | dsh 插件入口：钩子注册、命令注册、能力不足时降级并告警 |
 
 实现中确认的语义（易误判，已写入测试）：
@@ -662,8 +662,9 @@ commit():
 | 7 | undo 标记 id 固定为 `hide-<start>-<end>`，重复回退同一段会撞 id | 每条标记用 `randomUUID()` 生成唯一 id |
 | 8 | redo 副本沿用原件 `message.id` / tool-call id，客户端若按 id 建 key 会把两轮折叠 | `src/replay.mjs`：每条消息换新 id，assistant 的 tool-call、stream 与 tool/result 同步重映射 |
 | 9 | compaction 改写 surface 后，按旧边界重放会落到错误位置 | undo 记录 `replaceGeneration/contentGeneration`；redo 前不一致就拒绝（“对话已被压缩或改写”） |
+| 10 | undo 要连续回答“目标 → 范围 → 确认”，交互过重 | `/undo` 只保留目标 picker，选中即执行；有 git 同时回退文件与对话，无 git 自动仅对话并注明 |
 
-测试：`node --test --test-isolation=none test/*.test.mjs` → **73 pass / 0 fail**；
+测试：`node --test --test-isolation=none test/*.test.mjs` → **74 pass / 0 fail**；
 `node scripts/verify-host.mjs` → **9/9 PASS**（真机 rc.2）。
 
 仍然存在的风险与下一步：

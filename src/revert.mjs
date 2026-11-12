@@ -84,7 +84,9 @@ export class RevertService {
       const { timeline, visible } = await this.#view(state);
       const boundarySeq = resolveVisibleTarget(timeline, visible, seq ?? messageID);
       const origin = state.copies?.[boundarySeq] ?? boundarySeq;
-      const original = state.revert?.snapshot ?? (await this.#capture());
+      // Conversation-only undo must not require git: only a file undo captures
+      // the worktree and looks for a head tree to diff against.
+      const original = files ? (state.revert?.snapshot ?? (await this.#capture())) : state.revert?.snapshot;
       const restore = this.#restorePlan({ state, timeline, boundarySeq: origin, files, original });
 
       const hidden = await this.#session.hideFrom(boundarySeq);

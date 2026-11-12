@@ -1,4 +1,4 @@
-﻿import { test } from 'node:test';
+import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdir, rm } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -9,7 +9,7 @@ import { surfaceNodes } from '../src/surface.mjs';
 import { workspaceDirectory } from '../src/paths.mjs';
 import { assistant, FakeSession, MemorySnapshot, surfacePort, user } from './fake-session.mjs';
 
-async function harness(t) {
+async function harness(t, { probeGit = async () => true } = {}) {
   const root = join(process.cwd(), '.tmp', 'runtime', randomUUID());
   await mkdir(root, { recursive: true });
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -23,6 +23,7 @@ async function harness(t) {
     portFor: async () => port,
     cwdOf: async () => cwd,
     openSnapshot: async () => snapshot,
+    probeGit,
   });
   return { root, cwd, snapshot, session, runtime, stateRoot: workspaceDirectory(root, cwd) };
 }
@@ -146,6 +147,20 @@ test('undo is refused while a step is in flight', async (t) => {
   const box = await threeTurns(t);
   await box.runtime.preStep({ session: box.session });
   await assert.rejects(() => box.runtime.undo({ session: box.session, seq: 0 }), /正在执行/);
+});
+
+test('without git, undo still hides the conversation and reports skipped files', async (t) => {
+  const box = await harness(t, { probeGit: async () => false });
+  box.session.append('turn/start', { turn: 1 });
+  box.session.append('user/message', user('m1', 'm1'), { surfaceOp: 'append' });
+
+  const targets = await box.runtime.targets(box.session);
+  const result = await box.runtime.undo({ session: box.session, seq: targets[0].seq });
+
+  assert.equal(result.filesSkipped, true);
+  assert.deepEqual(result.files, []);
+  assert.deepEqual(visibleUsers(box.session), []);
+  assert.equal((await box.runtime.status(box.session)).filesAvailable, false);
 });
 
 test('targets and preview describe the undo without applying it', async (t) => {

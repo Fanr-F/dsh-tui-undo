@@ -1,5 +1,6 @@
 import { join } from 'node:path';
-import { SnapshotService } from './snapshot.mjs';
+import { SnapshotError, SnapshotService } from './snapshot.mjs';
+import { gitAvailable } from './git.mjs';
 import { SnapshotRecorder } from './collect.mjs';
 import { RevertService } from './revert.mjs';
 import { StateError } from './store.mjs';
@@ -18,18 +19,21 @@ export class RewindRuntime {
   #portFor;
   #cwdOf;
   #openSnapshot;
+  #probeGit;
   #logger;
   #scope;
   #snapshots = new Map();
+  #git = new Map();
   #pending = new Map();
   #queue = new Map();
 
-  constructor({ root, portFor, cwdOf, openSnapshot, scope = '.', logger } = {}) {
+  constructor({ root, portFor, cwdOf, openSnapshot, probeGit = gitAvailable, scope = '.', logger } = {}) {
     if (!root || !portFor || !cwdOf) throw new TypeError('RewindRuntime needs root, portFor and cwdOf');
     this.#root = root;
     this.#portFor = portFor;
     this.#cwdOf = cwdOf;
     this.#openSnapshot = openSnapshot ?? ((options) => SnapshotService.open(options));
+    this.#probeGit = probeGit;
     this.#logger = logger ?? { warn() {}, info() {} };
     this.#scope = scope;
   }
@@ -38,6 +42,7 @@ export class RewindRuntime {
   async preStep({ session }) {
     const context = await this.#context(session);
     await this.#commitIfSuperseded(context);
+    if (!context.hasGit) return { tree: undefined, uncovered: [] };
     const captured = await this.#serialized(context.cwd, () => context.snapshot.capture({ scope: this.#scope }));
     this.#pending.set(session.id, { start: captured.tree, uncovered: captured.uncovered });
     return { tree: captured.tree, uncovered: captured.uncovered };
@@ -84,13 +89,22 @@ export class RewindRuntime {
   async undo({ session, target, seq, messageID, files = true }) {
     this.#assertIdle(session);
     const context = await this.#context(session);
-    return context.revert.undo({ target: target ?? seq, seq: seq ?? target, messageID, files });
+    const useFiles = files && context.hasGit;
+    const result = await context.revert.undo({
+      target: target ?? seq,
+      seq: seq ?? target,
+      messageID,
+      files: useFiles,
+    });
+    return { ...result, filesSkipped: files && !context.hasGit };
   }
 
   async redo({ session, files = true }) {
     this.#assertIdle(session);
     const context = await this.#context(session);
-    return context.revert.redo({ files });
+    const useFiles = files && context.hasGit;
+    const result = await context.revert.redo({ files: useFiles });
+    return { ...result, filesSkipped: files && !context.hasGit };
   }
 
   async commit(session) {
@@ -107,6 +121,7 @@ export class RewindRuntime {
       snapshots: Object.keys(state.snapshots).length,
       pending: this.#pending.has(session.id),
       redoAvailable: Boolean(state.revert),
+      filesAvailable: context.hasGit,
     };
   }
 
@@ -147,11 +162,20 @@ export class RewindRuntime {
     const port = await this.#portFor(session);
     const cwd = await this.#cwdOf(session);
     if (!cwd) throw new StateError('会话没有本地工作目录');
-    const snapshot = await this.#snapshotFor(cwd);
+    const hasGit = await this.#hasGit(cwd);
+    const snapshot = hasGit ? await this.#snapshotFor(cwd) : unavailableSnapshot();
     const root = workspaceDirectory(this.#root, cwd);
     const recorder = new SnapshotRecorder({ snapshot, root, sessionId: session.id, scope: this.#scope });
     const revert = new RevertService({ snapshot, session: port, root });
-    return { port, cwd, snapshot, root, recorder, revert };
+    return { port, cwd, snapshot, root, recorder, revert, hasGit };
+  }
+
+  /** Whether file snapshots are usable here; a missing git degrades to chat-only undo. */
+  async #hasGit(cwd) {
+    if (!this.#git.has(cwd)) {
+      this.#git.set(cwd, this.#probeGit(cwd).catch(() => false));
+    }
+    return this.#git.get(cwd);
   }
 
   async #snapshotFor(cwd) {
@@ -190,4 +214,18 @@ export function messageText(event) {
     .filter((block) => block?.type === 'text' && typeof block.text === 'string')
     .map((block) => block.text)
     .join('\n');
+}
+
+/**
+ * Stand-in snapshot service when `git` is missing.
+ *
+ * Chat-only undo/redo never touches it; snapshot capture (pre-step recording)
+ * fails loudly through the caller's own error handling, so the plugin keeps
+ * working without git instead of blocking every turn.
+ */
+function unavailableSnapshot() {
+  const fail = () => {
+    throw new SnapshotError('unavailable', 'git is not available; file snapshots are disabled');
+  };
+  return { capture: fail, files: fail, diff: fail, restore: fail, listTree: fail };
 }

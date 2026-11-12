@@ -2,12 +2,16 @@
  * dsh-tui surface for undo / redo.
  *
  * Dialogs come from the host (`ctx.get('tuiDialogs')`), so this module never
- * touches the terminal. Handlers resolve to a command result instead of
- * throwing: the harness renders failures as text, and a cancelled dialog is a
- * silent success so no draft is lost.
+ * touches the terminal. Undo applies as soon as the target is picked: the
+ * target dialog is the only question. When git is available it restores both
+ * the conversation and the worktree; without git it falls back to the
+ * conversation only and says so in the result.
+ *
+ * Handlers resolve to a command result instead of throwing: the harness renders
+ * failures as text, and a cancelled dialog is a silent success so no draft is
+ * lost.
  */
 const DIALOG_TIMEOUT_MS = 5 * 60 * 1000;
-const FILES_SHOWN = 8;
 const errorText = (error) => (error instanceof Error ? error.message : String(error));
 const fail = (text) => ({ kind: 'error', text: text || '操作失败' });
 const cancelled = () => ({ kind: 'success', text: '' });
@@ -18,15 +22,12 @@ function short(value, limit) {
   return text.length > limit ? `${text.slice(0, Math.max(0, limit - 1))}…` : text;
 }
 
-function scopeMessage(preview, target, files) {
-  const lines = [
-    `回退到「${short(target?.text, 80) || '（附件消息）'}」之前`,
-    `对话：隐藏 ${preview.hidden.turns} 轮、${preview.hidden.events} 条事件（可重做）`,
-    files ? `文件：${preview.paths.length} 个` : '文件：不修改',
-  ];
-  for (const path of (files ? preview.paths : []).slice(0, FILES_SHOWN)) lines.push(`· ${path}`);
-  if (preview.paths.length > FILES_SHOWN) lines.push(`· 另有 ${preview.paths.length - FILES_SHOWN} 个文件`);
-  return lines.join('\n');
+function fileSummary(result) {
+  if (result.filesSkipped) return '未找到 git，文件未改动';
+  const changed = result.files?.length ?? 0;
+  const failed = result.restore?.failed?.length ?? 0;
+  if (!changed) return '没有文件需要恢复';
+  return `文件 ${changed} 个${failed ? `，${failed} 个失败` : ''}`;
 }
 
 export function createCommands({ runtime, dialogs }) {
@@ -60,69 +61,27 @@ export function createCommands({ runtime, dialogs }) {
     if (!targets.length) return fail('还没有可回退的用户消息');
 
     const options = targets.map((target) => ({
-      id: target.messageID,
+      id: String(target.seq),
       label: short(target.text, 100) || '（附件消息）',
-      description: `隐藏 ${target.hidden.turns} 轮 · ${target.hidden.events} 条事件`,
+      description: `隐藏 ${target.hidden.turns} 轮 · ${target.hidden.events} 条消息`,
     }));
-    let messageID;
+
+    let choice;
     try {
-      messageID = await service.select({ title: '回退到哪条消息之前？', options, signal: invocation.signal, timeoutMs: DIALOG_TIMEOUT_MS });
+      choice = await service.select({ title: '回退到哪条消息之前？', options, signal: invocation.signal, timeoutMs: DIALOG_TIMEOUT_MS });
     } catch (error) {
       return fail(errorText(error));
     }
-    if (messageID === undefined) return cancelled();
-    const target = targets.find((item) => item.messageID === messageID);
+    if (choice === undefined) return cancelled();
+
+    const target = targets.find((item) => String(item.seq) === choice);
     if (!target) return fail('这条消息已经不在当前对话中');
 
-    let preview;
     try {
-      preview = await runtime.preview(session, target.seq);
-    } catch (error) {
-      return fail(errorText(error));
-    }
-
-    let scope;
-    try {
-      scope = await service.select({
-        title: '回退范围',
-        options: [
-          { id: 'both', label: '对话 + 文件', description: `同时把 ${preview.paths.length} 个文件恢复原状` },
-          { id: 'conversation', label: '仅对话', description: '工作区文件保持不变' },
-        ],
-        signal: invocation.signal,
-        timeoutMs: DIALOG_TIMEOUT_MS,
-      });
-    } catch (error) {
-      return fail(errorText(error));
-    }
-    if (scope === undefined) return cancelled();
-    const files = scope !== 'conversation';
-
-    let approved;
-    try {
-      approved = await service.confirm({
-        title: '确认回退？',
-        message: scopeMessage(preview, target, files),
-        confirmLabel: '回退',
-        cancelLabel: '取消',
-        signal: invocation.signal,
-        timeoutMs: DIALOG_TIMEOUT_MS,
-      });
-    } catch (error) {
-      return fail(errorText(error));
-    }
-    if (!approved) return cancelled();
-
-    try {
-      const result = await runtime.undo({ session, seq: target.seq, files });
-      const changed = result.files?.length ?? 0;
-      const failed = result.restore?.failed?.length ?? 0;
+      const result = await runtime.undo({ session, seq: target.seq, files: true });
       return {
         kind: 'success',
-        text:
-          `已回退到「${short(target?.text, 40) || '（附件消息）'}」之前：隐藏 ${result.hidden.turns} 轮，` +
-          (files ? `文件 ${changed} 个${failed ? `，${failed} 个失败` : ''}` : '文件未改动') +
-          '。可用 /redo 重做。',
+        text: `已回退到「${short(target.text, 40) || '（附件消息）'}」之前：隐藏 ${result.hidden.turns} 轮，${fileSummary(result)}。可用 /redo 重做。`,
       };
     } catch (error) {
       return fail(errorText(error));
@@ -164,7 +123,13 @@ export function createCommands({ runtime, dialogs }) {
 
     try {
       const result = await runtime.redo({ session });
-      return { kind: 'success', text: result.cleared ? '已重做到最新：回退记录已清空。' : `已重做一步，当前回退到「${short(result.boundarySeq, 20)}」。` };
+      const note = result.filesSkipped ? '（未找到 git，文件未改动）' : '';
+      return {
+        kind: 'success',
+        text: result.cleared
+          ? `已重做到最新：回退记录已清空。${note}`
+          : `已重做一步，当前回退到「${short(result.boundarySeq, 20)}」。${note}`,
+      };
     } catch (error) {
       return fail(errorText(error));
     }
