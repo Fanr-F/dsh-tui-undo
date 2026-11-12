@@ -737,3 +737,26 @@ dump-config:  # == dsh-tui-undo / - id: dsh-tui-undo / name: dsh-tui-undo
 2. `pnpm` 安装时会用到用户级 store 锁（`%LOCALAPPDATA%\pnpm-store-operation-locks`），
    在 DSH 的 workspace-write 沙箱下需要 `danger-full-access` 才能安装；测试时已授权执行。
 
+### 21.8 实测：TUI 转录不读 surface（v5 的关键缺口）
+
+真实测试（`d:\Code\git-test`，创建 `dsh-undo-redo.txt` → `/undo` → `/redo`）暴露了一个宿主侧限制：
+
+- 会话日志证明插件逻辑成立：undo 追加 `developer/message`（replace 17–36），redo 在
+  seq 43–51 追加了 4 条 user、3 条 assistant、3 条 tool/result 副本（id 已重写）。
+- 但 dsh-tui 的转录（`src/channel/projection.ts`）只按**原始事件流**折叠，从不读取
+  `session.surface`；`@deepseek-ai/dsh-session/surface.ts` 也明确说 surface 是
+  “model-visible”，转录应使用 append-origin 事件。
+- assistant 行以 `turn:step` 为 key（`assistantRowsByStep`），redo 副本保留了原
+  turn/step，于是**原地覆盖**旧行而不是新增 → 视觉上“redo 没反应”。
+- undo 同理：surface 隐藏不会删除已折叠的行，所以转录也不会消失。
+
+也就是说：**文件回退正确，模型上下文回退正确，但 TUI 画面不会跟着 surface 回退。**
+这不是插件内能修好的问题，需要改动 dsh-tui 的转录层，例如：
+
+1. 在 `session/event` 里识别 `surfaceOp: replace`，用 surface 节点重建转录（需要一个
+   “清空并重放”的通道，现有 replay 批次只复用/追加行，不清空）；
+2. 或把 `/undo` 改为 TUI 原生 `/rewind` 的 fork 式会话切换（画面正确，但跨会话的
+   redo 语义要重新设计）。
+
+在决定之前，插件保持现状：state/文件/模型上下文按 v5 工作，TUI 视觉层不动。
+
