@@ -1,9 +1,9 @@
 # opencode 的 undo / redo 实现分析
 
 > 分析对象：本地 `D:\Code\opencode`，`opencode` 包版本 **1.17.10**，HEAD `b2c688f`（2026-06-25）。
-> 目的：为 DSH Rewind（本仓库插件）等"对话回退 + 文件回退"能力提供实现参考。
+> 目的：为 dsh-tui 的 undo / redo（本仓库项目）等"对话回退 + 文件回退"能力提供实现参考。
 > 说明：文中路径均相对 opencode 仓库根目录；`文件:行号` 为写文档时的实际位置，后续版本可能漂移。
-> 配套：与本插件（DSH Rewind）实现的逐项对比见 [`undo-comparison.md`](./undo-comparison.md)。
+> 配套：dsh-tui 侧的需求、宿主能力与验收标准见 [`dsh-tui-undo-redo-prd.md`](./dsh-tui-undo-redo-prd.md)；与 DSH Rewind 插件的逐项对比在插件仓库 `prd/undo-comparison.md`（不在本仓库）。
 
 ---
 
