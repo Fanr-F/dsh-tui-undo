@@ -719,6 +719,16 @@ dsh --profile undo-demo --dump-config
 `require.resolve('dsh-tui-undo', { paths: [profile] })` 解析到本仓库 `src/index.mjs`；
 入口导出 `name/apply/install` 正常。
 
+真实 profile 安装（2026-11-12）：已装入 `~/.dsh/profiles/dsh-tui`：
+
+```text
+dependencies: "dsh-tui-undo": "link:d:/Code/dsh-tui-undo"
+bundles:      [@deepseek-ai/dsh-base, @deepseek-harness-tui/dsh-tui, dsh-tui-undo]
+dump-config:  # == dsh-tui-undo / - id: dsh-tui-undo / name: dsh-tui-undo
+```
+
+这是 `link:` 安装：改 `src/` 后重启 TUI 即生效，不需要重新安装。
+
 尚未完成：
 
 1. 真实 TUI 交互冒烟（`dsh tui --patch ./examples/tui-local.cordis.yml`）仍需人工跑一次；
