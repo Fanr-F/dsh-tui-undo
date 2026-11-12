@@ -1,6 +1,7 @@
 import { StateError, acquireLock, readState, writeState } from './store.mjs';
 import { isUserMessage, nextBoundary, plan, touchedFiles, userMessages } from './timeline.mjs';
 import { isSurfaceEligible } from './surface.mjs';
+import { REPLAY_TURN_BASE } from './replay.mjs';
 
 /**
  * Undo / redo over one session, built on surface replacement.
@@ -148,7 +149,14 @@ export class RevertService {
           isSurfaceEligible(event.type) &&
           !visible.has(event.seq),
       );
-      const copies = segment.length ? await this.#session.showCopies(segment, { rewrite: true }) : [];
+      const copies = segment.length
+        ? await this.#session.showCopies(segment, {
+            rewrite: true,
+            // Keep copied turns clear of the live turn counter (and of earlier
+            // replay turns), so a transcript keyed by turn:step draws new rows.
+            turnBase: REPLAY_TURN_BASE + maxTurnOf(timeline),
+          })
+        : [];
       const mapping = { ...(state.copies ?? {}) };
       copies.forEach((event, index) => {
         mapping[event.seq] = segment[index].seq;
@@ -307,4 +315,14 @@ function replayableEvents(timeline, visible, copies) {
 function messageIdAt(timeline, seq) {
   const event = timeline.find((candidate) => candidate.seq === seq);
   return event?.data?.id;
+}
+
+/** Highest turn number anywhere in the log (including earlier replay copies). */
+function maxTurnOf(timeline) {
+  let max = 0;
+  for (const event of timeline) {
+    const turn = event.data?.turn;
+    if (Number.isInteger(turn) && turn > max) max = turn;
+  }
+  return max;
 }

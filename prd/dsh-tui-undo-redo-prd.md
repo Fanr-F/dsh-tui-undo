@@ -664,7 +664,7 @@ commit():
 | 9 | compaction 改写 surface 后，按旧边界重放会落到错误位置 | undo 记录 `replaceGeneration/contentGeneration`；redo 前不一致就拒绝（“对话已被压缩或改写”） |
 | 10 | undo 要连续回答“目标 → 范围 → 确认”，交互过重 | `/undo` 只保留目标 picker，选中即执行；有 git 同时回退文件与对话，无 git 自动仅对话并注明 |
 
-测试：`node --test --test-isolation=none test/*.test.mjs` → **74 pass / 0 fail**；
+测试：`node --test --test-isolation=none test/*.test.mjs` → **75 pass / 0 fail**；
 `node scripts/verify-host.mjs` → **9/9 PASS**（真机 rc.2）。
 
 仍然存在的风险与下一步：
@@ -759,4 +759,20 @@ dump-config:  # == dsh-tui-undo / - id: dsh-tui-undo / name: dsh-tui-undo
    redo 语义要重新设计）。
 
 在决定之前，插件保持现状：state/文件/模型上下文按 v5 工作，TUI 视觉层不动。
+
+### 21.9 redo 在按 turn:step 建 key 的转录里不可见（插件侧缓解）
+
+沿用 21.8 的结论后，先做了一个**不依赖 TUI 改动**的缓解：
+
+- `src/replay.mjs` 给副本分配 **replay turn 命名空间**（`turnBase = 1_000_000 + 当前最大 turn`），
+  副本的 `turn` 落在 100 万以上、且随每次 redo 单调增加；
+- assistant / tool-result 的 `turn` 一起重写，`step` 保持不变；
+- 副本上的 `usage` 被删除，避免 token meter 重复计费；
+- `src/surface.mjs` 的 `showCopies(..., { rewrite, turnBase })` 透传。
+
+这样 dsh-tui 的 `assistantRowsByStep`（key = `turn:step`）会把副本当成**新行**追加，
+而不是原地更新旧行；`/redo` 至少能看见恢复出来的内容。若 undo 后旧行确实已被移出，
+redo 就是完整恢复；若旧行仍在（surface 不驱动转录），则能看到副本而非“无反应”。
+
+这仍然是缓解，不是根治：转录层真正跟随 surface 需要 21.8 里的 TUI 改动。
 

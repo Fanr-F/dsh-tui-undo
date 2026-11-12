@@ -79,6 +79,16 @@ test('tool calls stay paired with their results after the rewrite', () => {
   assert.equal(result.data.message.source.callId, nextCall);
 });
 
+test('copied turns move into the replay namespace and drop usage', () => {
+  const events = toolTurn();
+  events[1].data.usage = { input: 10, output: 5 };
+  const { events: prepared } = rewriteForReplay(events, { newId: counter(), turnBase: 2_000_000 });
+
+  assert.equal(prepared[1].data.turn, 2_000_000);
+  assert.equal(prepared[2].data.turn, 2_000_000);
+  assert.equal(prepared[1].data.usage, undefined);
+});
+
 test('a tool result without its call in the segment still gets a usable id', () => {
   const orphan = [toolTurn()[2]];
   const { events: prepared } = rewriteForReplay(orphan, { newId: counter() });

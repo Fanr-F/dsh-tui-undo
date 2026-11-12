@@ -124,9 +124,9 @@ export function supportsBatchAppend(session) {
  * replayed turn is a new durable identity rather than a duplicate of a hidden
  * original; see `src/replay.mjs`.
  */
-export function showCopies(session, events, { rewrite = false, newId } = {}) {
+export function showCopies(session, events, { rewrite = false, newId, turnBase } = {}) {
   const prepared = rewrite
-    ? rewriteForReplay(events, { newId }).events
+    ? rewriteForReplay(events, { newId, turnBase }).events
     : [...events].map((event) => ({ type: event.type, data: event.data, originSeq: event.seq }));
   const inputs = prepared.map((event) => [
     event.type,
