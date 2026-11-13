@@ -37,7 +37,9 @@ function createReact() {
 function createSlots() {
   const entries = [{ options: { priority: 0 }, component: () => 'original' }];
   const listeners = new Set();
-  const disposers = [];
+  const notify = () => {
+    for (const listener of listeners) listener();
+  };
   const slots = {
     entries: () => [...entries],
     subscribe: (_name, listener) => {
@@ -51,14 +53,13 @@ function createSlots() {
       }
       const entry = { options, component };
       entries.push(entry);
-      for (const listener of listeners) listener();
-      const dispose = () => {
+      entries.sort((left, right) => (left.options.priority ?? 0) - (right.options.priority ?? 0));
+      notify();
+      return () => {
         const index = entries.indexOf(entry);
         if (index >= 0) entries.splice(index, 1);
-        for (const listener of listeners) listener();
+        notify();
       };
-      disposers.push(dispose);
-      return dispose;
     },
   };
   return { slots, entries, listeners };
@@ -94,15 +95,17 @@ test('the client module declares its services and applies', () => {
   assert.equal(typeof module.apply, 'function');
 });
 
-test('applying swaps the chat flow component and restores it on dispose', () => {
+test('applying wins the flow slot below the host and releases it on dispose', () => {
   const module = load();
   const { ctx, entries, dispose } = createContext();
   const original = entries[0].component;
   module.apply(ctx);
-  assert.equal(entries.length, 2, 'a probe registration publishes the swap');
+  assert.equal(entries.length, 2, 'a lower-priority entry shadows the host component');
   assert.notEqual(entries[0].component, original);
   assert.equal(entries[0].component.__dshTuiUndoFlow, true);
+  assert.equal(entries[1].component, original);
   dispose();
+  assert.equal(entries.length, 1);
   assert.equal(entries[0].component, original);
 });
 
