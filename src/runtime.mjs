@@ -316,7 +316,13 @@ export class RewindRuntime {
         if (event.sourceEventSeqs) options.sourceEventSeqs = event.sourceEventSeqs;
         session.append(event.type, event.data, options);
       }
-      this.#host.appendPluginRecord?.(session, 'plugin:dsh-tui-undo/commit', { id: operation.entry.id });
+      // The commit marker is a recovery aid, never a requirement: a host that
+      // refuses plugin records must not fail the rewind itself.
+      try {
+        this.#host.appendPluginRecord?.(session, 'plugin:dsh-tui-undo/commit', { id: operation.entry.id });
+      } catch (markerError) {
+        this.#logger?.warn?.(`dsh-tui-undo: 提交标记写入失败：${markerError?.message ?? markerError}`);
+      }
       await this.#flush(session);
     } catch (error) {
       await this.#rollback(session, context, journal).catch((failure) => {

@@ -411,7 +411,21 @@ commands (/undo /redo)
   `plugins/??dsh-tui-undo/client.js`；`/api/dsh-tui-undo/state` 带浏览器会话
   返回 200；`test/client.test.mjs` 用假 loader/React/槽位验证替换、过滤与还原。
 
-### 16.5 仍未做（M4）
+### 16.5 dsh-tui 兼容性（结论）
+
+- **功能层兼容**：插件在 dsh-tui profile 里正常挂载（`dsh --profile dsh-tui
+  --dump-config` 有行），`agents` / `sessions` / `commands` / `agent/pre-step` /
+  `runMaintenance` 都在；`/undo` `/undo <n>` `/redo`、文件恢复、重新加载与 web
+  完全同一条路径。`tuiDialogs` 存在时会走选择框。
+- **界面层不兼容**：dsh-tui 的转录由 `projectChannelRows(channel.rows)` 按追加
+  顺序生成，整个 lib 不读 `surface.nodes`（只有一下 fork/migration 路径用到
+  `surfaceOp`），也没有行过滤服务（`tuiMessageObserver` 是只读外发观察器，
+  `tuiRenderers`/`tuiScenes` 是面板不是转录）。因此撤回后旧回复仍留在屏幕上，
+  重做后会出现副本。
+- 要做到界面回退，需要改 dsh-tui 的转录层（或它自己提供过滤钩子），不在本插件
+  范围；需要界面反馈时用 dsh-tui 原生 `/rewind`（fork 式，不恢复文件）。
+
+### 16.6 仍未做（M4）
 
 - dsh-tui 转录层；turn rail / 大纲里的隐藏回合过滤；性能与并发压测；
   旧 PRD 的迁档清理。

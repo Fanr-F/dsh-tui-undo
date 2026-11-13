@@ -34,9 +34,10 @@ export function createValidator({ Session, catalog, projections = [] } = {}) {
     } catch (error) {
       throw new HistoryError(`重放后的日志没有通过格式校验：${error.message}`, error);
     }
-    if (typeof Session?.create === 'function') {
+    if (typeof Session?.create === 'function' || typeof session?.constructor?.create === 'function') {
+      const Constructor = typeof session?.constructor?.create === 'function' ? session.constructor : Session;
       try {
-        Session.create(session.id, session.snapshotEvents(), session.header, session.inheritedEventCount ?? 0, projections);
+        Constructor.create(session.id, session.snapshotEvents(), session.header, session.inheritedEventCount ?? 0, projections);
       } catch (error) {
         throw new HistoryError(`重放后的日志无法重新打开：${error.message}`, error);
       }
@@ -48,16 +49,19 @@ export function createValidator({ Session, catalog, projections = [] } = {}) {
 /**
  * Detached session factory used to fold a log prefix.
  *
- * `eventState: 'shared-frozen'` tells `Session.fromRestore` the events were
- * already validated and may be shared, which is true for a prefix of a live
- * session and avoids a deep copy per undo.
+ * The live session's own class is preferred: a `link:`-installed plugin may
+ * resolve a second copy of `@deepseek-ai/dsh-session` from another profile, and
+ * a foreign class would make identity checks disagree with the host. A prefix
+ * of a live session was already validated, so `eventState: 'shared-frozen'`
+ * lets it share the events instead of deep-copying them.
  */
 export function createDetachedFactory(Session, projections = []) {
-  if (typeof Session?.fromRestore !== 'function') {
-    throw new HistoryError('host session cannot restore a detached prefix');
-  }
   return function createDetached(session, events) {
-    return Session.fromRestore(
+    const Constructor = typeof session?.constructor?.fromRestore === 'function' ? session.constructor : Session;
+    if (typeof Constructor?.fromRestore !== 'function') {
+      throw new HistoryError('host session cannot restore a detached prefix');
+    }
+    return Constructor.fromRestore(
       session.id,
       events,
       session.header,
