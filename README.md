@@ -40,7 +40,7 @@ dsh plugin --profile web add link:D:/Code/dsh-tui-undo
 Web 输入框里：
 
 ```
-/undo          列出可回退的消息（最近的在最前，第一条消息不算目标）
+/undo          列出可回退的消息（最近的在最前，第一条也算目标）
 /undo 2        立刻回退到第 2 条之前
 /redo          重做上一次回退
 ```

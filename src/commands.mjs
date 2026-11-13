@@ -35,10 +35,16 @@ export function createCommands({ runtime, dialogs }) {
     }
   };
 
-  /** Candidate list, newest first; the conversation's first message is not a target. */
+  /**
+   * Candidate list, newest first.
+   *
+   * The conversation's first message *is* a valid target: rewinding before it
+   * empties the transcript and restores the files that turn created, which is
+   * exactly what "undo the only thing I just did" means.
+   */
   async function candidates(session) {
     const targets = await runtime.targets(session);
-    return targets.slice(1).reverse();
+    return [...targets].reverse();
   }
 
   function listing(targets) {

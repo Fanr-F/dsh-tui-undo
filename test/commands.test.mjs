@@ -33,11 +33,22 @@ test('/undo without an argument lists the candidates and changes nothing', async
   const result = await commands.undo(invocation(''));
   assert.equal(result.kind, 'success');
   assert.match(result.text, /可回退到以下消息之前/);
-  // Newest first, and the conversation's first message is not offered.
+  // Newest first; the first message is a target too.
   assert.match(result.text, /1\. third message/);
   assert.match(result.text, /2\. second message/);
-  assert.doesNotMatch(result.text, /first message/);
+  assert.match(result.text, /3\. first message/);
   assert.deepEqual(calls.undo, []);
+});
+
+test('/undo offers the only message of a fresh conversation', async () => {
+  const { runtime, calls } = fakeRuntime({ targets: async () => [{ seq: 10, label: 'first', text: 'first' }] });
+  const commands = createCommands({ runtime, dialogs: () => undefined });
+  const listed = await commands.undo(invocation(''));
+  assert.equal(listed.kind, 'success');
+  assert.match(listed.text, /1\. first/);
+  const applied = await commands.undo(invocation('1'));
+  assert.equal(applied.kind, 'success');
+  assert.deepEqual(calls.undo, [10]);
 });
 
 test('/undo <n> applies the chosen target immediately', async () => {

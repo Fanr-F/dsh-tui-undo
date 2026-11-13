@@ -106,6 +106,50 @@ test('a redo replay reloads through the real format catalog', { skip }, () => {
   assert.equal(itemsOf(reopened).length, 4);
 });
 
+test('rewinding to before the first message keeps the system head', { skip }, () => {
+  const session = host.Session.create('format-check', [], header(), 0, []);
+  session.append('turn/start', { turn: 1 });
+  session.append('step/start', { turn: 1, step: 1 });
+  session.append(
+    'system/message',
+    {
+      turn: 1,
+      step: 1,
+      message: { id: 'sys', role: 'system', source: { kind: 'system-prompt' }, content: [{ type: 'text', text: 'You are dsh.' }] },
+    },
+    { surfaceOp: 'append' },
+  );
+  const userRow = session.append('user/message', user('m1', 'create a file'), { surfaceOp: 'append' });
+  session.append(
+    'assistant/message',
+    { turn: 1, step: 1, message: assistant('a1', 'done'), stream: [], usage: { input: 1, output: 1 } },
+    { surfaceOp: 'append' },
+  );
+  session.append('step/end', { turn: 1, step: 1 });
+  session.append('turn/end', { turn: 1, reason: { kind: 'completed' } });
+
+  // The only user message is a valid target: rewind to before it.
+  const desired = beforeSeq(session, userRow.seq, { createDetached: host.createDetached });
+  assert.deepEqual(desired.map((item) => item.type), ['system/message']);
+
+  session.append('turn/start', { turn: 2 });
+  const { events } = buildReplay(session, desired, {
+    turn: 2,
+    step: 1,
+    createDetached: host.createDetached,
+    validate: host.validate,
+  });
+  appendReplay(session, events);
+  session.append('turn/end', { turn: 2, reason: { kind: 'blocked' } });
+
+  assert.doesNotThrow(() => host.validate(session));
+  const reopened = host.Session.create('format-check', session.snapshotEvents(), header(), 0, []);
+  assert.deepEqual(
+    itemsOf(reopened).map((item) => item.data.message.content[0].text),
+    ['You are dsh.'],
+  );
+});
+
 test('v5 shape — a message appended after turn/end — is rejected', { skip }, () => {
   const session = seed(1);
   session.append('developer/message', {
