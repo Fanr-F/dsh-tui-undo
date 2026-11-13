@@ -25,13 +25,18 @@ function short(value, limit) {
 }
 
 function fileSummary(result) {
+  if (result.filesAvailable === false) return '只回退了对话（未找到 git，文件未改动）';
   const changed = result.files ?? 0;
   const failed = result.restored?.failed?.length ?? 0;
-  if (!changed) return '没有文件需要恢复';
-  return `恢复了 ${changed} 个文件${failed ? `（${failed} 个失败）` : ''}`;
+  if (!changed) {
+    const known = result.snapshots ?? 0;
+    return `没有文件需要恢复（本会话记录了 ${known} 个步骤快照）`;
+  }
+  const names = (result.paths ?? []).slice(0, 5).join('、');
+  return `恢复了 ${changed} 个文件${names ? `（${names}）` : ''}${failed ? `，${failed} 个失败` : ''}`;
 }
 
-export function createCommands({ runtime, dialogs, logger }) {
+export function createCommands({ runtime, dialogs, logger, log }) {
   const dialogService = () => {
     try {
       return dialogs?.();
@@ -41,6 +46,7 @@ export function createCommands({ runtime, dialogs, logger }) {
   };
   const note = (message) => {
     try {
+      log?.write('command', message);
       logger?.(message);
     } catch {
       /* logging must never break the command */
@@ -137,7 +143,7 @@ export function createCommands({ runtime, dialogs, logger }) {
       };
     } catch (error) {
       note(`/undo 失败：${errorText(error)}`);
-      return fail(errorText(error));
+      return fail(hint(errorText(error)));
     }
   }
 
@@ -150,11 +156,43 @@ export function createCommands({ runtime, dialogs, logger }) {
       return { kind: 'success', text: `已重做上一次回退：${fileSummary(result)}。` };
     } catch (error) {
       note(`/redo 失败：${errorText(error)}`);
+      return fail(hint(errorText(error)));
+    }
+  }
+
+  /** Attach the log location so a failure is actionable. */
+  function hint(text) {
+    const file = runtime.logFile;
+    return file ? `${text}\n（详细日志：${file}）` : text;
+  }
+
+  /** Self-check: what the plugin thinks it can do in this session. */
+  async function status(invocation) {
+    const session = invocation?.agent?.session;
+    if (!session?.id) return fail('当前没有可操作的会话');
+    try {
+      const info = await runtime.status(session);
+      const targets = await runtime.targets(session);
+      const recent = info.snapshottedSeqs.slice(-8).join(', ');
+      return {
+        kind: 'success',
+        text: [
+          `插件：已加载（会话 ${session.id}）`,
+          `工作目录：${info.cwd ?? '未知'}`,
+          `文件恢复：${info.filesAvailable ? '可用' : '不可用（未找到 git）'}`,
+          `已记录步骤快照：${info.snapshots} 个${recent ? `，最近 seq ${recent}` : ''}`,
+          `可回退的消息：${targets.length} 条`,
+          `撤回栈：${info.undoDepth} 次，可重做：${info.redoDepth} 次`,
+          `日志：${runtime.logFile ?? '未启用'}`,
+          info.busy ? '注意：有未完成的撤回记录' : '状态：空闲',
+        ].join('\n'),
+      };
+    } catch (error) {
       return fail(errorText(error));
     }
   }
 
-  return { undo, redo };
+  return { undo, redo, status };
 }
 
 /** Turn a hung maintenance turn into visible feedback instead of silence. */

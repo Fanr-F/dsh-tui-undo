@@ -55,16 +55,16 @@ test('a TUI-shaped host mounts the plugin and its commands', async () => {
   const { context, commands, listeners } = fakeContext({
     services: { commands: {} },
   });
-  await install(context, { storageDir: 'D:\\tmp\\dsh-undo-install-test' });
+  await install(context, { storageDir: 'D:\\tmp\\dsh-undo-install-test', log: false });
 
-  assert.deepEqual([...commands.keys()].sort(), ['redo', 'undo']);
+  assert.deepEqual([...commands.keys()].sort(), ['redo', 'undo', 'undo-status']);
   assert.equal(typeof listeners.get('agent/pre-step'), 'function');
   assert.equal(typeof listeners.get('session/event'), 'function');
 });
 
 test('/undo works on such a host without rewind state', async () => {
   const { context, commands } = fakeContext({ services: { commands: {} } });
-  await install(context, { storageDir: 'D:\\tmp\\dsh-undo-install-test-2' });
+  await install(context, { storageDir: 'D:\\tmp\\dsh-undo-install-test-2', log: false });
 
   const session = new FakeSession();
   const result = await commands.get('undo').handler(invocation(session));
@@ -74,8 +74,9 @@ test('/undo works on such a host without rewind state', async () => {
 
 test('/redo reports the missing state instead of throwing', async () => {
   const { context, commands } = fakeContext({ services: { commands: {} } });
-  await install(context, { storageDir: 'D:\\tmp\\dsh-undo-install-test-3' });
+  await install(context, { storageDir: 'D:\\tmp\\dsh-undo-install-test-3', log: false });
   const result = await commands.get('redo').handler(invocation(new FakeSession()));
   assert.equal(result.kind, 'error');
   assert.match(result.text, /没有可重做的撤回/);
 });
+

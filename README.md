@@ -54,6 +54,17 @@ dsh-tui 里如果宿主提供 `tuiDialogs`，`/undo` 会弹出选择框；选完
   文件逐个还原；重做时还原这次撤回改动过的文件。
 - 没有 `git`：只回退对话，并在结果里说明。
 
+## 日志
+
+插件自己写一份诊断日志，默认在 `~/.dsh/rewind/dsh-tui-undo.log`
+（`config.storageDir` 会一起改路径；`config.log === false` 关闭，
+`config.log = '<path>'` 指定文件）。它记录：命令入口、每步快照、
+撤回计划、journal、append 的真实序号、`turn/end` 结算，以及失败堆栈的首帧。
+
+- `/undo-status` 会打印日志路径；
+- 撤回失败时错误文本里也会附上路径；
+- `node scripts/diagnose.mjs "<工作目录>"` 会把会话、state、影子仓库和日志一起打出来。
+
 ## 崩溃安全
 
 每次操作先写 journal（含计划中的状态和回滚所需的文件树），再恢复文件、追加日志、

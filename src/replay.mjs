@@ -51,7 +51,13 @@ export function buildReplay(session, desired, { turn, step = 1, createDetached, 
   if (!Array.isArray(desired)) throw new ReplayError('replay needs a message snapshot');
 
   const clone = createDetached(session, session.snapshotEvents());
-  const start = clone.seq;
+  // Two sequence spaces: the clone (a restored seed) may carry an extra
+  // `session/end-seed` row, so its numbering can be one ahead of the live log.
+  // Surface *contents* are identical, but everything this module reports to the
+  // runtime (event seqs, the hide marker, the copy map) must be live-space.
+  const cloneStart = clone.seq;
+  const liveStart = session.seq;
+  const toLive = (cloneSeq) => liveStart + (cloneSeq - cloneStart);
   clone.append('step/start', { turn, step });
 
   const current = itemsOf(session);
@@ -147,11 +153,15 @@ export function buildReplay(session, desired, { turn, step = 1, createDetached, 
   }
 
   clone.append('step/end', { turn, step });
-  const prepared = clone.snapshotEvents().slice(start);
+  const prepared = clone.snapshotEvents().slice(cloneStart).map((event, index) => ({
+    ...event,
+    seq: liveStart + index,
+  }));
+  const liveCopies = copies.map((entry) => ({ seq: toLive(entry.seq), origin: entry.origin }));
 
   // Prove the result decodes before the runtime commits anything: a rejected
   // replay must leave the worktree and the log untouched.
   clone.append('turn/end', { turn, reason: { kind: 'blocked' } });
   if (typeof validate === 'function') validate(clone);
-  return { events: prepared, hidden, copies, marker };
+  return { events: prepared, hidden, copies: liveCopies, marker: Number.isSafeInteger(marker) ? toLive(marker) : marker };
 }

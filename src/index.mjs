@@ -1,6 +1,8 @@
 import { createCommands } from './commands.mjs';
 import { loadHost } from './host.mjs';
+import { createLog } from './log.mjs';
 import { RewindRuntime, defaultRewindRoot } from './runtime.mjs';
+import { join } from 'node:path';
 
 export const name = 'dsh-tui-undo';
 export const inject = ['agents', 'sessions'];
@@ -33,6 +35,15 @@ async function readJson(request) {
  */
 export async function install(ctx, config = {}) {
   const root = config.storageDir ?? defaultRewindRoot();
+  const log = createLog({
+    file:
+      config.log === false
+        ? undefined
+        : typeof config.log === 'string'
+          ? config.log
+          : join(root, 'dsh-tui-undo.log'),
+  });
+  log.write('plugin', 'install', { root, enabled: config.log !== false });
   let host;
   try {
     host = await loadHost({
@@ -44,10 +55,16 @@ export async function install(ctx, config = {}) {
     ctx.logger?.warn?.(`dsh-tui-undo: 初始化失败，撤回功能已禁用：${error?.message ?? error}`);
     host = { available: false, reason: `撤回初始化失败：${error?.message ?? error}` };
   }
+  log.write('plugin', host.available === false ? 'host modules unavailable' : 'host modules loaded', {
+    reason: host.reason,
+    version: host.Session?.name ?? host.Session?.constructor?.name,
+    catalog: Boolean(host.catalog),
+  });
 
   const runtime = new RewindRuntime({
     root,
     host,
+    log,
     cwdOf: async (session) => ctx.get?.('workingDirectory')?.get(session) ?? session.header?.cwd,
     flush: async (session) => ctx.sessions?.flush?.(session),
     logger: ctx.logger,
@@ -97,12 +114,14 @@ export async function install(ctx, config = {}) {
   ctx.inject(['commands'], (scope) => {
     const commands = createCommands({
       runtime,
+      log,
       dialogs: () => ctx.get?.('tuiDialogs'),
       logger: (message) => ctx.logger?.warn?.(`dsh-tui-undo ${message}`),
     });
     const rows = [
       ['undo', '回退到之前的某条消息（可重做）', commands.undo, { hint: '编号；不带编号会列出可回退的消息' }],
       ['redo', '重做上一次回退', commands.redo],
+      ['undo-status', '查看撤回插件状态（自检）', commands.status],
     ];
     for (const [command, description, handler, input] of rows) {
       scope.effect(() => {

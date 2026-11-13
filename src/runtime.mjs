@@ -7,6 +7,7 @@ import { beforeSeq, mergeRanges, userTargets } from './history.mjs';
 import { buildReplay } from './replay.mjs';
 import { plan as filePlan } from './timeline.mjs';
 import { workspaceDirectory } from './paths.mjs';
+import { describeError } from './log.mjs';
 
 /**
  * Undo / redo orchestration for one plugin instance.
@@ -32,6 +33,7 @@ export class RewindRuntime {
   #probeGit;
   #openSnapshot;
   #logger;
+  #log;
   #scope;
   #snapshots = new Map();
   #git = new Map();
@@ -42,7 +44,7 @@ export class RewindRuntime {
   #ops = new Map();
   #recovered = new Set();
 
-  constructor({ root, host, cwdOf, flush, logger, scope = '.', probeGit = gitAvailable, openSnapshot } = {}) {
+  constructor({ root, host, cwdOf, flush, logger, scope = '.', probeGit = gitAvailable, openSnapshot, log } = {}) {
     if (!root || !host || !cwdOf) throw new TypeError('RewindRuntime needs root, host and cwdOf');
     this.#root = root;
     this.#host = host;
@@ -52,10 +54,20 @@ export class RewindRuntime {
     this.#openSnapshot = openSnapshot ?? ((options) => SnapshotService.open(options));
     this.#logger = logger ?? { warn() {}, info() {} };
     this.#scope = scope;
+    this.#log = log ?? { file: null, write() {}, async flush() {}, async tail() { return ''; } };
+  }
+
+  #trace(scope, message, data) {
+    void this.#log.write(scope, message, data);
   }
 
   get available() {
     return this.#host.available !== false;
+  }
+
+  /** Where the diagnostic log lives, for `/undo-status` and error hints. */
+  get logFile() {
+    return this.#log.file ?? null;
   }
 
   /** `agent/pre-step`: capture for a live step, or rewrite from a maintenance turn. */
@@ -63,12 +75,16 @@ export class RewindRuntime {
     const session = agent?.session;
     if (!session?.id) return next();
     const operation = this.#ops.get(session.id);
-    if (operation) return this.#intercept(agent, operation, { messages, turn });
+    if (operation) {
+      this.#trace('prestep', 'claim maintenance turn', { session: session.id, turn, seq: session.seq, messages: messages.length });
+      return this.#intercept(agent, operation, { messages, turn });
+    }
     try {
       await this.#ensureRecovered(session);
       await this.checkpoint(session, messages);
       await this.capture(session);
     } catch (error) {
+      this.#trace('prestep', 'capture failed', describeError(error));
       this.#logger?.warn?.(`dsh-tui-undo: 步骤快照失败：${error?.message ?? error}`);
     }
     return next();
@@ -142,13 +158,19 @@ export class RewindRuntime {
     };
   }
 
-  async status(session) {    const state = await readState(this.#root, session.id);
+  async status(session) {
+    const state = await readState(this.#root, session.id);
     const context = await this.#context(session, { optional: true });
     return {
       undoAvailable: state.undo.length > 0,
       redoAvailable: state.redo.length > 0,
       view: state.view,
       filesAvailable: Boolean(context?.hasGit),
+      cwd: context?.cwd ?? null,
+      snapshots: Object.keys(state.snapshots).length,
+      snapshottedSeqs: Object.keys(state.snapshots).map(Number).sort((left, right) => left - right),
+      undoDepth: state.undo.length,
+      redoDepth: state.redo.length,
       busy: Boolean(state.journal),
       lastTarget: state.undo.at(-1)?.targetSeq ?? null,
     };
@@ -168,15 +190,35 @@ export class RewindRuntime {
     const useFiles = Boolean(files && context?.hasGit);
     let head;
     if (useFiles) head = await this.#captureTree(context);
+    const planned = useFiles
+      ? filePlan({ timeline: session.snapshotEvents(), snapshots: state.snapshots, boundarySeq: seq, copies: state.copies })
+      : new Map();
     const entry = {
       id: operationId(),
       targetSeq: seq,
       beforeSeq: session.seq,
-      files: useFiles ? [...filePlan({ timeline: session.snapshotEvents(), snapshots: state.snapshots, boundarySeq: seq, copies: state.copies }).keys()] : [],
+      files: [...planned.keys()],
       head,
       createdAt: Date.now(),
     };
-    return this.#launch(agent, { op: 'undo', entry, useFiles, text: target.text });
+    this.#trace('undo', 'requested', {
+      session: session.id,
+      targetSeq: seq,
+      beforeSeq: entry.beforeSeq,
+      hasGit: Boolean(context?.hasGit),
+      cwd: context?.cwd ?? null,
+      snapshots: Object.keys(state.snapshots).length,
+      planned: [...planned.keys()],
+      head: head?.slice(0, 10) ?? null,
+    });
+    const result = await this.#launch(agent, { op: 'undo', entry, useFiles, text: target.text });
+    this.#trace('undo', 'completed', { seq, files: result?.files ?? 0, snapshots: Object.keys(state.snapshots).length });
+    return {
+      ...result,
+      filesAvailable: useFiles,
+      snapshots: Object.keys(state.snapshots).length,
+      plannedPaths: [...planned.keys()],
+    };
   }
 
   /** Re-apply the rewind that the last undo replaced. */
@@ -211,9 +253,13 @@ export class RewindRuntime {
 
   async capture(session) {
     const context = await this.#context(session, { optional: true });
-    if (!context?.hasGit) return;
+    if (!context?.hasGit) {
+      this.#trace('capture', 'skipped (no git)', { cwd: context?.cwd ?? null });
+      return;
+    }
     const tree = await this.#captureTree(context);
     this.#pending.set(session.id, { start: tree });
+    this.#trace('capture', 'captured step start', { cwd: context.cwd, tree: tree?.slice(0, 10) });
   }
 
   dispose() {
@@ -224,18 +270,25 @@ export class RewindRuntime {
   // ---------------------------------------------------------------- internals
 
   async #intercept(agent, operation, { messages, turn }) {
-    if (operation.turn !== undefined) return { kind: 'reject' };
+    if (operation.turn !== undefined) {
+      this.#trace('prestep', 'already claimed', { turn });
+      return { kind: 'reject' };
+    }
     operation.turn = turn;
     // The marker rides in `next-step`; claiming a step also steals one queued
     // turn. Hand everything that is not our marker back to the inbox.
+    let returned = 0;
     for (const message of [...messages].reverse()) {
       if (message?.id === operation.marker) continue;
       agent.inbox.prepend(operation.queue.get(message?.id) ?? 'next-turn', message);
+      returned += 1;
     }
+    this.#trace('apply', 'start', { op: operation.op, turn, seq: agent.session.seq, returned });
     try {
       operation.result = await this.#apply(agent, operation, turn);
     } catch (error) {
       operation.error = error;
+      this.#trace('apply', 'failed', describeError(error));
     }
     return { kind: 'reject' };
   }
@@ -248,6 +301,14 @@ export class RewindRuntime {
 
     const cut = operation.op === 'undo' ? operation.entry.targetSeq : operation.entry.beforeSeq;
     const desired = beforeSeq(session, cut, { createDetached: this.#host.createDetached });
+    this.#trace('apply', 'planned', {
+      op: operation.op,
+      cut,
+      liveSeq: session.seq,
+      desired: desired.length,
+      cwd: context?.cwd ?? null,
+      hasGit: Boolean(context?.hasGit),
+    });
     // Dry run: prove the replay decodes *before* the journal and the files move.
     // The real build happens again right before the append, so a host that
     // records its own bookkeeping events during the awaits below cannot shift
@@ -259,6 +320,12 @@ export class RewindRuntime {
       validate: this.#host.validate,
     });
     if (!preview.events.length) throw new StateError('没有可重放的内容');
+    this.#trace('apply', 'preview built', {
+      events: preview.events.length,
+      firstSeq: preview.events[0]?.seq,
+      marker: preview.marker,
+      copies: preview.copies.length,
+    });
 
     const restore = operation.useFiles && context?.hasGit ? this.#restorePlan(operation, state, session, cut) : new Map();
     let next;
@@ -288,6 +355,7 @@ export class RewindRuntime {
     };
     await this.#mutate(session.id, async (current) => {
       if (current.journal) throw new StateError('上一次撤回还没有完成，请稍后再试');
+      this.#trace('apply', 'journal written', { id: journal.id, files: journal.rollback.files });
       return writeState(this.#root, { ...current, journal });
     });
 
@@ -297,7 +365,11 @@ export class RewindRuntime {
     let copies;
     let marker;
     try {
-      if (restore.size) restored = await context.snapshot.restore(restore);
+      if (restore.size) {
+        this.#trace('apply', 'restoring files', { files: [...restore.keys()] });
+        restored = await context.snapshot.restore(restore);
+        this.#trace('apply', 'restored', { restored: restored?.restored?.length ?? 0, removed: restored?.removed?.length ?? 0, failed: restored?.failed?.length ?? 0 });
+      }
       // Rebuild against the live session, then append synchronously: from here
       // to the last `append` there is no await, so the numbering cannot drift.
       start = session.seq;
@@ -307,6 +379,13 @@ export class RewindRuntime {
         createDetached: this.#host.createDetached,
         validate: this.#host.validate,
       }));
+      this.#trace('apply', 'appending', {
+        start,
+        events: events.length,
+        firstSeq: events[0]?.seq,
+        lastSeq: events.at(-1)?.seq,
+        marker,
+      });
       for (const event of events) {
         const options = {};
         if (event.surfaceOp !== undefined) options.surfaceOp = event.surfaceOp;
@@ -321,16 +400,19 @@ export class RewindRuntime {
         this.#logger?.warn?.(`dsh-tui-undo: 提交标记写入失败：${markerError?.message ?? markerError}`);
       }
       await this.#flush(session);
+      this.#trace('apply', 'flushed', { seq: session.seq });
     } catch (error) {
+      this.#trace('apply', 'append failed', describeError(error));
       await this.#rollback(session, context, journal).catch((failure) => {
         this.#logger?.warn?.(`dsh-tui-undo: 回滚文件失败：${failure?.message ?? failure}`);
+        this.#trace('apply', 'rollback failed', describeError(failure));
       });
       throw error;
     }
 
     // `turn/end` returns the real end sequence; ranges are settled there.
     operation.settlement = { cut, start, marker, copies, journalStart: journal.startSeq };
-    return { files: restore.size, restored, view: next.view };
+    return { files: restore.size, paths: [...restore.keys()], restored, view: next.view };
   }
 
   /**
@@ -374,15 +456,28 @@ export class RewindRuntime {
       await this.#mutate(session.id, async (current) => {
         const planned = current.journal?.state;
         if (!planned) {
+          this.#trace('finish', 'no journal to settle', { turn: event.data?.turn, endSeq: event.seq });
           state = current;
           return current;
         }
         state = await writeState(this.#root, this.#settle(planned, operation, event.seq));
+        this.#trace('finish', 'settled', {
+          turn: event.data?.turn,
+          endSeq: event.seq,
+          undo: state.undo.length,
+          redo: state.redo.length,
+          hidden: state.hiddenRanges.length,
+        });
         return state;
       });
-      if (operation.error) operation.reject(operation.error);
-      else operation.resolve({ ...operation.result, state });
+      if (operation.error) {
+        this.#trace('finish', 'operation failed', describeError(operation.error));
+        operation.reject(operation.error);
+      } else {
+        operation.resolve({ ...operation.result, state });
+      }
     } catch (error) {
+      this.#trace('finish', 'settle failed', describeError(error));
       operation.reject(error);
     } finally {
       this.#ops.delete(session.id);
@@ -422,8 +517,16 @@ export class RewindRuntime {
           ...[...agent.inbox.nextStep].map((message) => [message.id, 'next-step']),
         ]);
         agent.steer(marker);
+        this.#trace('launch', 'maintenance requested', {
+          op: record.op,
+          session: session.id,
+          seq: session.seq,
+          marker: record.marker,
+          queued: record.queue.size,
+        });
       });
     } catch (error) {
+      this.#trace('launch', 'runMaintenance failed', describeError(error));
       this.#ops.delete(session.id);
       throw error;
     }
@@ -458,6 +561,7 @@ export class RewindRuntime {
     } else {
       snapshot.files = [];
     }
+    this.#trace('capture', 'recorded step', { seq, start: start?.slice(0, 10), end: end?.slice(0, 10), files: snapshot.files });
     await this.#mutate(session.id, async (current) => {
       return writeState(this.#root, { ...current, snapshots: { ...current.snapshots, [seq]: snapshot } });
     });

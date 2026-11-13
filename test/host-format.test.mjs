@@ -68,6 +68,9 @@ test('a maintenance-turn replay reloads through the real format catalog', { skip
     createDetached: host.createDetached,
     validate: host.validate,
   });
+  // The detached seed can carry an extra session/end-seed row; everything the
+  // runtime appends must still be numbered in the live log's sequence space.
+  assert.equal(events[0].seq, session.seq);
   appendReplay(session, events);
   // The host loop appends turn/end itself, after the plugin's events.
   session.append('turn/end', { turn: 4, reason: { kind: 'blocked' } });
