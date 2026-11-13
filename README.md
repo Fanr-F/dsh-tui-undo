@@ -22,10 +22,24 @@ dsh plugin --profile web add https://github.com/Fanr-F/dsh-tui-undo/releases/dow
 dsh plugin --profile web add github:Fanr-F/dsh-tui-undo
 ```
 
-本地开发用 `link:`：
+### 本地安装（开发）
+
+直接指向工作目录，改代码后重启会话即可生效：
 
 ```powershell
 dsh plugin --profile web add link:D:/Code/dsh-tui-undo
+```
+
+或者用本地打出来的 tgz 装一份快照（安装路径是绝对路径，必须是 `.tgz`）：
+
+```powershell
+dsh plugin --profile web add file:D:/Code/dsh-tui-undo/dsh-tui-undo-0.3.0.tgz
+```
+
+卸掉重装：
+
+```powershell
+dsh plugin --profile web remove dsh-tui-undo
 ```
 
 插件运行时需要宿主已经加载的 `@deepseek-ai/dsh-session` 与格式校验目录。
@@ -38,6 +52,48 @@ dsh plugin --profile web add link:D:/Code/dsh-tui-undo
 
 `package.json` 里带 `dsh.bundle.patch`，装完会自动出现在
 `dsh --profile web --dump-config` 的行列表里。
+
+## 打包
+
+仓库没有编译步骤：`src/*.mjs` 直接运行，`lib/client.js` 是手写的浏览器模块，
+不需要 `tsc`、rollup 或 bundle。
+
+打包前先跑测试（失败就不要打包）：
+
+```powershell
+npm test
+```
+
+然后打包：
+
+```powershell
+npm pack
+```
+
+产物是 `dsh-tui-undo-<version>.tgz`，版本取自 `package.json`。打进包里的只有
+`files` 白名单：
+
+```
+src/  lib/  cordis.patch.yml  dsh-plugin.json  examples/  README.md  package.json
+```
+
+只看内容、不落盘：
+
+```powershell
+npm pack --dry-run
+```
+
+打包后先本地装一遍确认能起来，再上传：
+
+```powershell
+dsh plugin --profile web add file:D:/Code/dsh-tui-undo/dsh-tui-undo-0.3.0.tgz
+```
+
+发布时把 tgz 作为 GitHub Release 附件上传，可以用 `gh release upload <tag> <tgz>`，
+或者直接在 Release 页面拖进去。
+
+> 发新版本时记得同时改两处版本号：`package.json` 的 `version` 和
+> `dsh-plugin.json` 的 `version`，然后用 `npm run verify:manifest` 校验。
 
 ## 使用
 
