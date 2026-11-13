@@ -3,7 +3,7 @@
   "manifestVersion": "0.15",
   "id": "dsh.tui-undo",
   "name": "dsh-tui-undo",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "facets": {
     "host": {
       "entry": "./src/index.mjs",
@@ -19,12 +19,12 @@
       {
         "id": "dsh.undo",
         "title": "Undo",
-        "description": "Hide the latest turns and restore the worktree to the boundary."
+        "description": "Rewind the conversation and the worktree to before a chosen user message."
       },
       {
         "id": "dsh.redo",
         "title": "Redo",
-        "description": "Bring back one hidden turn, or clear the revert when none remain."
+        "description": "Re-apply the rewind that the last undo replaced."
       }
     ]
   },

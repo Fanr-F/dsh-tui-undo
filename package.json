@@ -1,6 +1,6 @@
 {
   "name": "dsh-tui-undo",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "main": "./src/index.mjs",
@@ -12,9 +12,10 @@
     "cordis.patch.yml",
     "dsh-plugin.json",
     "examples",
+    "README.md",
     "package.json"
   ],
-  "description": "Snapshot-based undo / redo for dsh-tui workspaces and conversations (plugin-only).",
+  "description": "Undo / redo for dsh conversations and workspaces, replayed inside a real maintenance turn so the session log always reloads.",
   "engines": {
     "node": ">=22",
     "dsh": ">=0.2.2-rc.2 <0.3.0"
@@ -26,7 +27,7 @@
   },
   "scripts": {
     "test": "node --test --test-isolation=none test/*.test.mjs",
-    "verify:host": "node scripts/verify-host.mjs",
+    "verify:replay": "node --test --test-isolation=none test/host-format.test.mjs",
     "verify:manifest": "node scripts/verify-manifest.mjs"
   }
 }

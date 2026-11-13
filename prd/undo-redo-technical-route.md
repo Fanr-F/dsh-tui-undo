@@ -1,6 +1,6 @@
 # undo / redo 技术路线（v6）
 
-> 状态：设计定稿，待实现
+> 状态：M0–M2 已实现并在真实 rc.2 上验证；M3（web 客户端隐藏）待做
 > 日期：2026-11-13
 > 目标平台：**dsh web 优先**；dsh-tui 暂不作为验收目标
 > 参考实现：`D:\Code\dsh-undo-plugin`（MIT，只借鉴机制，不复制代码）
@@ -344,3 +344,55 @@ commands (/undo /redo)
   “surface 隐藏 + turn 外追加副本”。
 - 现有 `src/snapshot.mjs` / `collect.mjs` / `git.mjs` 继续使用；
   `src/revert.mjs` 的 `stage/clear` 与 `src/replay.mjs` 需要按本文重写。
+
+---
+
+## 16. 实现记录（v6，2026-11-13）
+
+### 16.1 落地文件
+
+| 文件 | 职责 |
+| --- | --- |
+| `src/host-modules.mjs` | 解析宿主的 `@deepseek-ai/dsh-session` / 格式目录（link 安装下裸包名解析不到） |
+| `src/host.mjs` | 组装 `Session`、`createDetached`、`validate`、`appendPluginRecord` |
+| `src/history.mjs` | surface 折叠成消息快照；`beforeSeq` 用 detached 前缀折叠 |
+| `src/replay.mjs` | 在给定 turn/step 内构造重放事件；返回 `{events, hidden, copies}` |
+| `src/validate.mjs` | 提交前用宿主的格式目录解码整条日志，并尝试 `Session.create` |
+| `src/store.mjs` | schema 2：`snapshots`/`copies`/`view`/`undo`/`redo`/`hiddenRanges`/`internalRanges`/`journal` |
+| `src/runtime.mjs` | maintenance 编排、pre-step 拦截、turn/end 收尾、崩溃恢复 |
+| `src/commands.mjs` | `/undo`（列表或 `编号`）、`/redo`；TUI 有 dialogs 时用选择框 |
+| `src/timeline.mjs` | 文件计划（按 step 的 `start` 树回填），保留 |
+
+### 16.2 与设计稿的差异
+
+1. **`targetSnapshot` 不落盘**。日志只增不减，`beforeSeq` 对同一 `cut` 的前缀折叠
+   永远得到同一份对话，因此 undo/redo 记录只存 `targetSeq` / `beforeSeq`。
+2. **新增 `copies` 映射**：重放出来的 assistant 行不能带 `sourceEventSeqs`
+   （宿主拒绝），所以「副本 seq → 原始 seq」由插件记在自己的 state 里，文件计划
+   才能找回那一步的快照。
+3. **重放前先做一次 target 校验**：`/undo` 只能指向当前 surface 上的用户消息；
+   第一条人类消息不作为目标（回退到它之前等于清空对话）。
+4. **web 命令是文本交互**：`/undo` 输出候选列表，`/undo <n>` 立即执行。没有
+   客户端插件也符合「选好就生效」，M3 再把列表换成界面组件。
+5. **commit 标记**用 `appendPluginRecord(session, 'plugin:dsh-tui-undo/commit', {id})`，
+   在 `turn/end` 之前追加，`endSeq` 据此推算。
+
+### 16.3 验证
+
+- `test/host-format.test.mjs` 直接 import 安装版 `@deepseek-ai/dsh-session`
+  与 `dsh-session-format-catalog`：
+  - 维护回合重放后 `Session.create` 重新打开成功；
+  - 连续两次重放（undo → redo）后仍可打开；
+  - v5 的「`turn/end` 之后追加 developer/message」被格式校验拒绝。
+- `test/runtime.test.mjs` 用 `FakeAgent` 复刻 `runMaintenance` / `steer` /
+  `pre-step reject` / 宿主追加 `turn/end`，断言 undo → redo → undo 的日志可重载、
+  文件正确、redo 在新消息后失效。
+- `test/replay.test.mjs` 覆盖重复 id、tool-call/result 配对、usage 剥离、
+  空目标。
+
+### 16.4 仍未做（M3/M4）
+
+- web 客户端按 `hiddenRanges` / 维护回合隐藏行（当前界面仍按追加顺序显示原始消息）；
+- dsh-tui 转录层；性能与并发压测；旧 PRD 的迁档清理。
+
+

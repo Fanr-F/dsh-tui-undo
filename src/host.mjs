@@ -1,11 +1,13 @@
 /**
- * Host adapter: binds one live DSH session to the ports `RevertService` uses.
+ * Host adapter: everything this plugin needs from the running DSH.
  *
- * DSH sessions are append-only (verified against the installed dsh-session and
- * by `scripts/verify-host.mjs`), so there is no log rewrite here: visibility is
- * controlled by `surfaceOp` markers, which `src/surface.mjs` appends.
+ * The plugin is usually installed with `link:` so bare `@deepseek-ai/*`
+ * imports do not resolve from its own directory; `host-modules.mjs` finds the
+ * packages the host already loaded. Everything below is derived from *that*
+ * session implementation, so event ids and projections are never duplicated.
  */
-import { hideFrom, showCopies, surfaceNodes } from './surface.mjs';
+import { loadFormatCatalog, loadSessionModule } from './host-modules.mjs';
+import { createDetachedFactory, createValidator } from './validate.mjs';
 
 export class HostError extends Error {
   constructor(message, cause) {
@@ -15,46 +17,28 @@ export class HostError extends Error {
   }
 }
 
-/** True when the object looks like a live DSH session we can drive. */
-export function canDrive(session) {
-  return Boolean(
-    session &&
-      typeof session.append === 'function' &&
-      typeof session.snapshotEvents === 'function' &&
-      session.surface &&
-      Array.isArray(session.surface.nodes),
-  );
-}
-
-export function describeHost(session) {
-  const missing = [];
-  if (typeof session?.append !== 'function') missing.push('append');
-  if (typeof session?.snapshotEvents !== 'function') missing.push('snapshotEvents');
-  if (!session?.surface || !Array.isArray(session.surface.nodes)) missing.push('surface');
-  return { canDrive: missing.length === 0, missing };
-}
-
 /**
- * The port `RevertService` expects.
+ * Resolve the host capabilities the runtime needs.
  *
- * `events()` returns the whole log (hidden events included) because sequence
- * numbers never change; `visible()` reports the current surface so the service
- * can tell hidden originals from replay copies.
+ * `available: false` disables conversation rewind (the plugin still loads and
+ * explains why) instead of failing the whole composition.
  */
-export function createSurfacePort({ session }) {
-  if (!canDrive(session)) {
-    throw new HostError(`this host cannot drive a session surface (missing ${describeHost(session).missing.join(', ')})`);
+export async function loadHost({ moduleRoot, projections = [], logger } = {}) {
+  const sessionModule = await loadSessionModule({ moduleRoot });
+  const catalogModule = await loadFormatCatalog({ moduleRoot });
+  if (!sessionModule?.Session) {
+    logger?.warn?.('dsh-tui-undo: 找不到宿主的 @deepseek-ai/dsh-session，撤回功能已禁用');
+    return { available: false, reason: '找不到宿主的会话模块（@deepseek-ai/dsh-session）' };
   }
+  const Session = sessionModule.Session;
+  const catalog = catalogModule?.sessionFormatCatalog;
+  if (!catalog) logger?.warn?.('dsh-tui-undo: 格式校验目录不可用，将跳过日志预校验');
   return {
-    id: session.id,
-    header: () => session.header,
-    events: () => structuredClone(session.snapshotEvents()),
-    visible: () => surfaceNodes(session),
-    generation: () => ({
-      replaceGeneration: session.surface.replaceGeneration,
-      contentGeneration: session.surface.contentGeneration,
-    }),
-    hideFrom: (startSeq) => hideFrom(session, { startSeq }),
-    showCopies: (events, options) => showCopies(session, events, options),
+    available: true,
+    Session,
+    catalog,
+    createDetached: createDetachedFactory(Session, projections),
+    validate: createValidator({ Session, catalog, projections }),
+    appendPluginRecord: sessionModule.appendPluginRecord,
   };
 }

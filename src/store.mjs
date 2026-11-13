@@ -3,7 +3,19 @@ import { mkdir, open, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { sessionStatePath } from './paths.mjs';
 
-export const SCHEMA = 1;
+/**
+ * Per-session rewind state (schema 2).
+ *
+ * The log is the durable truth; this file only remembers:
+ *   - `snapshots`: the worktree tree captured around each step;
+ *   - `undo` / `redo`: the view stack, where an entry is one applied rewind;
+ *   - `hiddenRanges` / `internalRanges`: what a client should hide, and which
+ *     log ranges belong to this plugin's maintenance turns;
+ *   - `journal`: the one in-flight operation, so a crash never leaves files and
+ *     conversation out of step.
+ */
+export const SCHEMA = 2;
+export const TREE = /^[0-9a-f]{40,64}$/;
 
 export class StateError extends Error {
   constructor(message, cause) {
@@ -19,8 +31,39 @@ export function createState(sessionId) {
     sessionId,
     revision: 0,
     snapshots: {},
-    hostChecks: {},
+    copies: {},
+    view: { cut: null },
+    undo: [],
+    redo: [],
+    hiddenRanges: [],
+    internalRanges: [],
+    journal: null,
   };
+}
+
+function assertRanges(value, field) {
+  if (value === undefined) return;
+  if (!Array.isArray(value)) throw new StateError(`rewind state has invalid ${field}`);
+  for (const range of value) {
+    if (!range || !Number.isSafeInteger(range.start) || !Number.isSafeInteger(range.end) || range.start > range.end) {
+      throw new StateError(`rewind state has an invalid ${field} entry`);
+    }
+  }
+}
+
+function assertEntry(entry, field) {
+  if (!entry || typeof entry !== 'object') throw new StateError(`rewind state has an invalid ${field} entry`);
+  if (typeof entry.id !== 'string' || !entry.id) throw new StateError(`rewind ${field} entry has no id`);
+  if (!Number.isSafeInteger(entry.targetSeq) || entry.targetSeq < 0) throw new StateError(`rewind ${field} entry has no target`);
+  if (!Number.isSafeInteger(entry.beforeSeq) || entry.beforeSeq < 0) throw new StateError(`rewind ${field} entry has no origin`);
+  if (entry.endSeq !== undefined && (!Number.isSafeInteger(entry.endSeq) || entry.endSeq < 0)) {
+    throw new StateError(`rewind ${field} entry has an invalid end`);
+  }
+  if (entry.files !== undefined && !Array.isArray(entry.files)) throw new StateError(`rewind ${field} entry has invalid files`);
+  for (const file of entry.files ?? []) if (typeof file !== 'string') throw new StateError(`rewind ${field} entry has an invalid file`);
+  if (entry.head !== undefined && entry.head !== null && !TREE.test(entry.head)) {
+    throw new StateError(`rewind ${field} entry has an invalid head tree`);
+  }
 }
 
 export function validateState(value, sessionId) {
@@ -36,45 +79,38 @@ export function validateState(value, sessionId) {
     if (!snapshot || typeof snapshot !== 'object') throw new StateError(`rewind snapshot ${seq} is not an object`);
     for (const field of ['start', 'end']) {
       const tree = snapshot[field];
-      if (tree !== undefined && !/^[0-9a-f]{40,64}$/.test(tree)) {
-        throw new StateError(`rewind snapshot ${seq} has an invalid ${field} tree`);
-      }
+      if (tree !== undefined && !TREE.test(tree)) throw new StateError(`rewind snapshot ${seq} has an invalid ${field} tree`);
     }
     if (snapshot.files !== undefined && !Array.isArray(snapshot.files)) {
       throw new StateError(`rewind snapshot ${seq} has invalid files`);
     }
   }
-  const revert = value.revert;
-  if (revert !== undefined) {
-    if (typeof revert.messageID !== 'string' || !Number.isInteger(revert.seq)) {
-      throw new StateError('rewind revert has no message or boundary');
-    }
-    if (revert.snapshot !== undefined && !/^[0-9a-f]{40,64}$/.test(revert.snapshot)) {
-      throw new StateError('rewind revert has an invalid head tree');
-    }
-    if (!Array.isArray(revert.files)) throw new StateError('rewind revert has no file list');
-    for (const entry of revert.files) {
-      if (!entry || typeof entry.file !== 'string') throw new StateError('rewind revert has an invalid file entry');
-    }
-    if (revert.surface !== undefined) {
-      const surface = revert.surface;
-      if (!surface || typeof surface !== 'object') throw new StateError('rewind revert has an invalid surface generation');
-      for (const field of ['replaceGeneration', 'contentGeneration']) {
-        if (!Number.isInteger(surface[field]) || surface[field] < 0) {
-          throw new StateError(`rewind revert has an invalid ${field}`);
-        }
-      }
-    }
+  const view = value.view ?? { cut: null };
+  if (view.cut !== null && (!Number.isSafeInteger(view.cut) || view.cut < 0)) throw new StateError('rewind state has an invalid view');
+  assertRanges(value.hiddenRanges, 'hiddenRanges');
+  assertRanges(value.internalRanges, 'internalRanges');
+  for (const field of ['undo', 'redo']) {
+    const stack = value[field];
+    if (stack === undefined) continue;
+    if (!Array.isArray(stack)) throw new StateError(`rewind state has an invalid ${field} stack`);
+    for (const entry of stack) assertEntry(entry, field);
   }
   if (value.copies !== undefined) {
     if (!value.copies || typeof value.copies !== 'object') throw new StateError('rewind state has invalid copies');
     for (const [seq, origin] of Object.entries(value.copies)) {
-      if (!/^\d+$/.test(seq) || !Number.isInteger(origin) || origin < 0) {
+      if (!/^\d+$/.test(seq) || !Number.isSafeInteger(origin) || origin < 0) {
         throw new StateError('rewind state has an invalid copy mapping');
       }
     }
   }
-  return value;
+  if (value.journal !== undefined && value.journal !== null) {
+    const journal = value.journal;
+    if (!journal || typeof journal !== 'object') throw new StateError('rewind state has an invalid journal');
+    if (typeof journal.id !== 'string' || !journal.id) throw new StateError('rewind journal has no id');
+    if (!['undo', 'redo'].includes(journal.op)) throw new StateError('rewind journal has an invalid operation');
+    if (!journal.state || typeof journal.state !== 'object') throw new StateError('rewind journal has no planned state');
+  }
+  return { ...value, copies: value.copies ?? {}, view, undo: value.undo ?? [], redo: value.redo ?? [], hiddenRanges: value.hiddenRanges ?? [], internalRanges: value.internalRanges ?? [], journal: value.journal ?? null };
 }
 
 export async function readState(root, sessionId) {
@@ -92,12 +128,12 @@ export async function readState(root, sessionId) {
   } catch (error) {
     throw new StateError(`rewind state at ${path} is not valid JSON`, error);
   }
+  if (parsed?.schema === 1) return createState(sessionId);
   return validateState(parsed, sessionId);
 }
 
 export async function writeState(root, state) {
-  const next = { ...state, schema: SCHEMA, revision: state.revision + 1 };
-  validateState(next, next.sessionId);
+  const next = validateState({ ...state, schema: SCHEMA, revision: state.revision + 1 }, state.sessionId);
   await atomicJson(sessionStatePath(root, next.sessionId), next);
   return next;
 }
@@ -116,8 +152,8 @@ async function atomicJson(path, value) {
 /**
  * Exclusive workspace lock.
  *
- * Undo mutates files and the session log, so two sessions in the same worktree
- * must not interleave. The lock file records the owner so a stale lock from a
+ * A rewind mutates files and the session log, so two sessions sharing one
+ * worktree must not interleave. The lock records its owner so a lock from a
  * killed process is identifiable instead of blocking forever.
  */
 export async function acquireLock(root, { owner, staleMs = 15 * 60 * 1000 } = {}) {
@@ -137,12 +173,12 @@ export async function acquireLock(root, { owner, staleMs = 15 * 60 * 1000 } = {}
     } catch (error) {
       if (error.code !== 'EEXIST') throw error;
       if (attempt === 1 || !(await isStale(path, staleMs))) {
-        throw new StateError('another session is currently rewinding this workspace');
+        throw new StateError('工作区正在被另一个会话回退，请稍后再试');
       }
       await rm(path, { force: true });
     }
   }
-  throw new StateError('another session is currently rewinding this workspace');
+  throw new StateError('工作区正在被另一个会话回退，请稍后再试');
 }
 
 async function isStale(path, staleMs) {
@@ -152,4 +188,9 @@ async function isStale(path, staleMs) {
   } catch {
     return true;
   }
+}
+
+/** A short, stable id for one rewind operation. */
+export function operationId() {
+  return randomUUID();
 }

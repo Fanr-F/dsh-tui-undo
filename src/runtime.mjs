@@ -1,198 +1,471 @@
+import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
-import { SnapshotError, SnapshotService } from './snapshot.mjs';
+import { SnapshotService } from './snapshot.mjs';
 import { gitAvailable } from './git.mjs';
-import { SnapshotRecorder } from './collect.mjs';
-import { RevertService } from './revert.mjs';
-import { StateError } from './store.mjs';
+import { StateError, operationId, readState, writeState } from './store.mjs';
+import { beforeSeq, mergeRanges, userTargets } from './history.mjs';
+import { buildReplay } from './replay.mjs';
+import { plan as filePlan } from './timeline.mjs';
 import { workspaceDirectory } from './paths.mjs';
 
 /**
- * Host-agnostic orchestration: capture per step, record per message, undo/redo
- * per request.
+ * Undo / redo orchestration for one plugin instance.
  *
- * Everything the harness owns arrives through injected functions (`portFor`,
- * `cwdOf`, `openSnapshot`), so this class is exercised by tests without a
- * running DSH instance.
+ * A rewind is a *maintenance turn*: the plugin asks the agent for a real,
+ * model-free turn (`agent.runMaintenance`), steers a marker message so the loop
+ * opens `turn/start`, and then rewrites the conversation from `agent/pre-step`
+ * before returning `{ kind: 'reject' }`. The loop appends `turn/end` itself, so
+ * every replayed message lives in a legal turn/step and the session still
+ * reloads. Nothing is truncated, nothing is forked, no turn number is invented.
+ *
+ * Order inside the borrowed step:
+ *   build+validate replay → journal → restore files → append → flush → commit
+ * state at `turn/end`. A crash anywhere keeps the journal, and the next step
+ * either adopts the committed log (commit marker present) or rolls the files
+ * back.
  */
 export class RewindRuntime {
   #root;
-  #portFor;
+  #host;
   #cwdOf;
-  #openSnapshot;
+  #flush;
   #probeGit;
+  #openSnapshot;
   #logger;
   #scope;
   #snapshots = new Map();
   #git = new Map();
   #pending = new Map();
   #queue = new Map();
+  #writes = new Map();
+  #tasks = new Set();
+  #ops = new Map();
+  #recovered = new Set();
 
-  constructor({ root, portFor, cwdOf, openSnapshot, probeGit = gitAvailable, scope = '.', logger } = {}) {
-    if (!root || !portFor || !cwdOf) throw new TypeError('RewindRuntime needs root, portFor and cwdOf');
+  constructor({ root, host, cwdOf, flush, logger, scope = '.', probeGit = gitAvailable, openSnapshot } = {}) {
+    if (!root || !host || !cwdOf) throw new TypeError('RewindRuntime needs root, host and cwdOf');
     this.#root = root;
-    this.#portFor = portFor;
+    this.#host = host;
     this.#cwdOf = cwdOf;
-    this.#openSnapshot = openSnapshot ?? ((options) => SnapshotService.open(options));
+    this.#flush = flush ?? (async () => {});
     this.#probeGit = probeGit;
+    this.#openSnapshot = openSnapshot ?? ((options) => SnapshotService.open(options));
     this.#logger = logger ?? { warn() {}, info() {} };
     this.#scope = scope;
   }
 
-  /** Pre-capture the worktree for the step that is about to run. */
-  async preStep({ session }) {
-    const context = await this.#context(session);
-    await this.#commitIfSuperseded(context);
-    if (!context.hasGit) return { tree: undefined, uncovered: [] };
-    const captured = await this.#serialized(context.cwd, () => context.snapshot.capture({ scope: this.#scope }));
-    this.#pending.set(session.id, { start: captured.tree, uncovered: captured.uncovered });
-    return { tree: captured.tree, uncovered: captured.uncovered };
+  get available() {
+    return this.#host.available !== false;
   }
 
-  /** Record the assistant message that closed a step. */
-  async event({ session, event: row }) {
-    if (row?.type === 'turn/end') {
-      // A turn that produced no assistant message leaves no snapshot to finish.
+  /** `agent/pre-step`: capture for a live step, or rewrite from a maintenance turn. */
+  async preStep({ agent, messages = [], turn } = {}, next) {
+    const session = agent?.session;
+    if (!session?.id) return next();
+    const operation = this.#ops.get(session.id);
+    if (operation) return this.#intercept(agent, operation, { messages, turn });
+    try {
+      await this.#ensureRecovered(session);
+      await this.checkpoint(session, messages);
+      await this.capture(session);
+    } catch (error) {
+      this.#logger?.warn?.(`dsh-tui-undo: 步骤快照失败：${error?.message ?? error}`);
+    }
+    return next();
+  }
+
+  /** `session/event`: finish a step snapshot, or close a maintenance operation. */
+  event(session, event) {
+    if (event?.type === 'turn/end') {
+      const operation = this.#ops.get(session.id);
+      if (operation && operation.turn === event.data?.turn) {
+        this.#pending.delete(session.id);
+        return this.#track(
+          this.#finish(session, operation, event).catch((error) => {
+            this.#ops.delete(session.id);
+            operation.reject(error);
+          }),
+        );
+      }
       this.#pending.delete(session.id);
       return undefined;
     }
-    if (row?.type !== 'assistant/message') return undefined;
+    if (event?.type !== 'assistant/message') return undefined;
     const pending = this.#pending.get(session.id);
-    // Redo copies are appended assistant messages too, but no step captured
-    // them; recording one would snapshot the *current* worktree under the
-    // copy's sequence number and race the redo's own state write.
     if (!pending) return undefined;
-    const context = await this.#context(session);
     this.#pending.delete(session.id);
-    const { snapshot } = await context.recorder.finish(row.seq, pending.start);
-    return snapshot;
+    return this.#track(
+      this.#recordStep(session, event.seq, pending.start).catch((error) => {
+        this.#logger?.warn?.(`dsh-tui-undo: 步骤快照失败：${error?.message ?? error}`);
+      }),
+    );
   }
 
-  /** Forget a pre-capture that never produced an assistant message. */
-  forget(session) {
-    return this.#pending.delete(session.id);
+  #track(task) {
+    this.#tasks.add(task);
+    void task.finally(() => this.#tasks.delete(task));
+    return task;
   }
 
-  async targets(session) {
-    const context = await this.#context(session);
-    const targets = await context.revert.targets();
-    return targets.map((target) => {
-      const event = context.port.events().find((row) => row.seq === target.seq);
-      return { ...target, text: messageText(event) };
-    });
+  /** Wait for every pending state write (tests and shutdown). */
+  async settle() {
+    while (this.#tasks.size > 0 || this.#writes.size > 0) {
+      await Promise.all([...this.#tasks, ...this.#writes.values()]);
+    }
   }
 
-  async preview(session, target) {
-    const context = await this.#context(session);
-    return context.revert.preview(target);
-  }
-
-  async undo({ session, target, seq, messageID, files = true }) {
-    this.#assertIdle(session);
-    const context = await this.#context(session);
-    const useFiles = files && context.hasGit;
-    const result = await context.revert.undo({
-      target: target ?? seq,
-      seq: seq ?? target,
-      messageID,
-      files: useFiles,
-    });
-    return { ...result, filesSkipped: files && !context.hasGit };
-  }
-
-  async redo({ session, files = true }) {
-    this.#assertIdle(session);
-    const context = await this.#context(session);
-    const useFiles = files && context.hasGit;
-    const result = await context.revert.redo({ files: useFiles });
-    return { ...result, filesSkipped: files && !context.hasGit };
-  }
-
-  async commit(session) {
-    const context = await this.#context(session);
-    return context.revert.commit();
+  /** Human turns the user can rewind to, oldest first. */
+  targets(session) {
+    return userTargets(session).map((target) => ({
+      ...target,
+      label: short(target.text, 100) || '（附件消息）',
+    }));
   }
 
   async status(session) {
-    const context = await this.#context(session);
-    const state = await context.revert.state();
+    const state = await readState(this.#root, session.id);
+    const context = await this.#context(session, { optional: true });
     return {
-      cwd: context.cwd,
-      revert: state.revert ?? null,
-      snapshots: Object.keys(state.snapshots).length,
-      pending: this.#pending.has(session.id),
-      redoAvailable: Boolean(state.revert),
-      filesAvailable: context.hasGit,
+      undoAvailable: state.undo.length > 0,
+      redoAvailable: state.redo.length > 0,
+      view: state.view,
+      filesAvailable: Boolean(context?.hasGit),
+      busy: Boolean(state.journal),
+      lastTarget: state.undo.at(-1)?.targetSeq ?? null,
     };
   }
 
-  /**
-   * Commit when the user has queued a new turn past the revert boundary.
-   *
-   * Only *visible*, non-replay user messages count: the hidden originals are
-   * still in the append-only log, and redo copies would otherwise look like
-   * fresh input and commit a revert that is still in use.
-   */
-  async #commitIfSuperseded(context) {
-    const state = await context.revert.state();
-    if (!state.revert) return false;
-    const visible = new Set(await context.port.visible());
-    const superseded = context.port
-      .events()
-      .some(
-        (event) =>
-          event.type === 'user/message' &&
-          event.data?.source?.kind === 'user' &&
-          visible.has(event.seq) &&
-          !state.copies?.[event.seq] &&
-          event.seq >= state.revert.seq,
-      );
-    if (!superseded) return false;
-    await context.revert.commit();
-    return true;
+  /** Rewind to just before the user message at `seq`. */
+  async undo({ agent, seq, files = true }) {
+    const session = agent?.session;
+    if (!session?.id) throw new StateError('当前没有可操作的会话');
+    if (!this.available) throw new StateError(this.#host.reason ?? '撤回功能不可用');
+    this.#assertIdle(session);
+    const target = userTargets(session).find((item) => item.seq === seq);
+    if (!target) throw new StateError('这条消息已经不在当前对话中');
+    const state = await readState(this.#root, session.id);
+    if (state.journal) throw new StateError('上一次撤回还没有完成，请稍后再试');
+    const context = await this.#context(session, { optional: true });
+    const useFiles = Boolean(files && context?.hasGit);
+    let head;
+    if (useFiles) head = await this.#captureTree(context);
+    const entry = {
+      id: operationId(),
+      targetSeq: seq,
+      beforeSeq: session.seq,
+      files: useFiles ? [...filePlan({ timeline: session.snapshotEvents(), snapshots: state.snapshots, boundarySeq: seq, copies: state.copies }).keys()] : [],
+      head,
+      createdAt: Date.now(),
+    };
+    return this.#launch(agent, { op: 'undo', entry, useFiles, text: target.text });
+  }
+
+  /** Re-apply the rewind that the last undo replaced. */
+  async redo({ agent, files = true }) {
+    const session = agent?.session;
+    if (!session?.id) throw new StateError('当前没有可操作的会话');
+    if (!this.available) throw new StateError(this.#host.reason ?? '撤回功能不可用');
+    this.#assertIdle(session);
+    const state = await readState(this.#root, session.id);
+    if (state.journal) throw new StateError('上一次撤回还没有完成，请稍后再试');
+    const entry = state.undo.at(-1);
+    if (!entry) throw new StateError('没有可重做的撤回');
+    const newer = session
+      .snapshotEvents()
+      .some((event) => event.seq > (entry.endSeq ?? 0) && event.type === 'user/message' && event.data?.source?.kind === 'user');
+    if (newer) throw new StateError('撤回之后又有了新消息，无法重做');
+    const context = await this.#context(session, { optional: true });
+    return this.#launch(agent, { op: 'redo', entry, useFiles: Boolean(files && context?.hasGit), text: '' });
+  }
+
+  /** A new human message invalidates the redo side of the stack. */
+  async checkpoint(session, messages) {
+    const fresh = (messages ?? []).some((message) => message?.source?.kind === 'user');
+    if (!fresh) return;
+    const state = await readState(this.#root, session.id);
+    if (!state.redo.length && state.view?.cut === null) return;
+    await this.#mutate(session.id, async (current) => {
+      if (!current.redo.length && current.view?.cut === null) return current;
+      return writeState(this.#root, { ...current, redo: [], view: { cut: null } });
+    });
+  }
+
+  async capture(session) {
+    const context = await this.#context(session, { optional: true });
+    if (!context?.hasGit) return;
+    const tree = await this.#captureTree(context);
+    this.#pending.set(session.id, { start: tree });
+  }
+
+  dispose() {
+    for (const operation of this.#ops.values()) operation.reject(new StateError('撤回插件已卸载'));
+    this.#ops.clear();
+  }
+
+  // ---------------------------------------------------------------- internals
+
+  async #intercept(agent, operation, { messages, turn }) {
+    if (operation.turn !== undefined) return { kind: 'reject' };
+    operation.turn = turn;
+    // The marker rides in `next-step`; claiming a step also steals one queued
+    // turn. Hand everything that is not our marker back to the inbox.
+    for (const message of [...messages].reverse()) {
+      if (message?.id === operation.marker) continue;
+      agent.inbox.prepend(operation.queue.get(message?.id) ?? 'next-turn', message);
+    }
+    try {
+      operation.result = await this.#apply(agent, operation, turn);
+    } catch (error) {
+      operation.error = error;
+    }
+    return { kind: 'reject' };
+  }
+
+  async #apply(agent, operation, turn) {
+    const session = agent.session;
+    const context = await this.#context(session, { optional: true });
+    const state = await readState(this.#root, session.id);
+    if (state.journal) throw new StateError('上一次撤回还没有完成，请稍后再试');
+
+    const cut = operation.op === 'undo' ? operation.entry.targetSeq : operation.entry.beforeSeq;
+    const desired = beforeSeq(session, cut, { createDetached: this.#host.createDetached });
+    const start = session.seq;
+    const { events, copies } = buildReplay(session, desired, {
+      turn,
+      step: 1,
+      createDetached: this.#host.createDetached,
+      validate: this.#host.validate,
+    });
+    if (!events.length) throw new StateError('没有可重放的内容');
+
+    const restore = operation.useFiles && context?.hasGit ? this.#restorePlan(operation, state, session, cut) : new Map();
+    const picture = { ...(state.copies ?? {}) };
+    for (const entry of copies) picture[entry.seq] = entry.origin;
+    // The marker row and the host's `turn/end` both land after our events.
+    const endSeq = start + events.length + 1;
+    const internal = { start, end: endSeq + 1 };
+    const hiddenRange = { start: cut, end: Math.max(cut, start - 1) };
+    let next;
+    if (operation.op === 'undo') {
+      next = {
+        ...state,
+        undo: [...state.undo, { ...operation.entry, endSeq }],
+        redo: [],
+        copies: picture,
+        view: { cut },
+        hiddenRanges: mergeRanges([...state.hiddenRanges, hiddenRange]),
+        internalRanges: mergeRanges([...state.internalRanges, internal]),
+      };
+    } else {
+      next = {
+        ...state,
+        undo: state.undo.slice(0, -1),
+        redo: [...state.redo, operation.entry],
+        copies: picture,
+        view: { cut: null },
+        hiddenRanges: mergeRanges([...state.hiddenRanges, hiddenRange]),
+        internalRanges: mergeRanges([...state.internalRanges, internal]),
+      };
+    }
+
+    const journal = {
+      id: operation.entry.id,
+      op: operation.op,
+      turn,
+      startSeq: start,
+      state: { ...next, journal: null },
+      rollback: { head: operation.entry.head ?? null, files: [...restore.keys()] },
+    };
+    await this.#mutate(session.id, async (current) => {
+      if (current.journal) throw new StateError('上一次撤回还没有完成，请稍后再试');
+      return writeState(this.#root, { ...current, journal });
+    });
+
+    let restored;
+    try {
+      if (restore.size) restored = await context.snapshot.restore(restore);
+      for (const event of events) {
+        if (session.seq !== event.seq) throw new StateError('会话在撤回过程中发生了变化，请重新试一次');
+        const options = {};
+        if (event.surfaceOp !== undefined) options.surfaceOp = event.surfaceOp;
+        if (event.sourceEventSeqs) options.sourceEventSeqs = event.sourceEventSeqs;
+        session.append(event.type, event.data, options);
+      }
+      this.#host.appendPluginRecord?.(session, 'plugin:dsh-tui-undo/commit', { id: operation.entry.id });
+      await this.#flush(session);
+    } catch (error) {
+      await this.#rollback(session, context, journal).catch((failure) => {
+        this.#logger?.warn?.(`dsh-tui-undo: 回滚文件失败：${failure?.message ?? failure}`);
+      });
+      throw error;
+    }
+
+    return { files: restore.size, restored, view: next.view, endSeq };
+  }
+
+  async #finish(session, operation, event) {
+    try {
+      await this.#flush(session);
+      let state;
+      await this.#mutate(session.id, async (current) => {
+        const planned = current.journal?.state;
+        if (!planned) {
+          state = current;
+          return current;
+        }
+        state = await writeState(this.#root, { ...planned, journal: null });
+        return state;
+      });
+      if (operation.error) operation.reject(operation.error);
+      else operation.resolve({ ...operation.result, state });
+    } catch (error) {
+      operation.reject(error);
+    } finally {
+      this.#ops.delete(session.id);
+    }
+  }
+
+  async #launch(agent, operation) {
+    const session = agent.session;
+    if (typeof agent.runMaintenance !== 'function') throw new StateError('当前会话不支持撤回所需的维护回合');
+    if (this.#ops.has(session.id)) throw new StateError('撤回正在进行中');
+    const done = Promise.withResolvers();
+    const record = {
+      ...operation,
+      done,
+      resolve: done.resolve,
+      reject: done.reject,
+      marker: undefined,
+      turn: undefined,
+      start: session.seq,
+      queue: new Map(),
+      result: undefined,
+      error: undefined,
+    };
+    this.#ops.set(session.id, record);
+    try {
+      await agent.runMaintenance(async () => {
+        const marker = {
+          id: `dsh-tui-undo:maintenance:${randomUUID()}`,
+          role: 'user',
+          source: { kind: 'dsh-tui-undo' },
+          content: [{ type: 'text', text: 'rewind' }],
+        };
+        record.marker = marker.id;
+        record.start = session.seq;
+        record.queue = new Map([
+          ...[...agent.inbox.nextTurn].map((message) => [message.id, 'next-turn']),
+          ...[...agent.inbox.nextStep].map((message) => [message.id, 'next-step']),
+        ]);
+        agent.steer(marker);
+      });
+    } catch (error) {
+      this.#ops.delete(session.id);
+      throw error;
+    }
+    return done.promise;
+  }
+
+  #restorePlan(operation, state, session, cut) {
+    if (operation.op === 'redo') {
+      const files = new Map();
+      if (operation.entry.head) for (const file of operation.entry.files ?? []) files.set(file, operation.entry.head);
+      return files;
+    }
+    return filePlan({ timeline: session.snapshotEvents(), snapshots: state.snapshots, boundarySeq: cut, copies: state.copies });
+  }
+
+  async #rollback(session, context, journal) {
+    const head = journal.rollback?.head;
+    const files = journal.rollback?.files ?? [];
+    if (head && files.length && context?.hasGit) {
+      await context.snapshot.restore(new Map(files.map((file) => [file, head])));
+    }
+    await this.#mutate(session.id, async (current) => writeState(this.#root, { ...current, journal: null }));
+  }
+
+  async #recordStep(session, seq, start) {
+    const context = await this.#context(session, { optional: true });
+    if (!context?.hasGit) return;
+    const end = await this.#captureTree(context);
+    const snapshot = { start, end };
+    if (start !== end) {
+      snapshot.files = await context.snapshot.files(start, end);
+    } else {
+      snapshot.files = [];
+    }
+    await this.#mutate(session.id, async (current) => {
+      return writeState(this.#root, { ...current, snapshots: { ...current.snapshots, [seq]: snapshot } });
+    });
+  }
+
+  async #ensureRecovered(session) {
+    if (this.#recovered.has(session.id)) return;
+    const state = await readState(this.#root, session.id);
+    if (!state.journal) {
+      this.#recovered.add(session.id);
+      return;
+    }
+    const context = await this.#context(session, { optional: true });
+    const committed = session
+      .snapshotEvents()
+      .some((event) => event.type === 'plugin:dsh-tui-undo/commit' && event.data?.id === state.journal.id);
+    if (committed) {
+      await this.#mutate(session.id, async (current) => writeState(this.#root, { ...(current.journal?.state ?? current), journal: null }));
+      this.#logger?.warn?.('dsh-tui-undo: 已恢复上次中断的撤回（日志已提交）');
+      this.#recovered.add(session.id);
+      return;
+    }
+    await this.#rollback(session, context, state.journal);
+    this.#logger?.warn?.('dsh-tui-undo: 已回滚上次中断的撤回（文件已还原）');
+    this.#recovered.add(session.id);
   }
 
   #assertIdle(session) {
-    if (this.#pending.has(session.id)) {
-      throw new StateError('会话正在执行，请先停止再撤回');
-    }
+    if (this.#pending.has(session.id)) throw new StateError('会话正在执行，请先停止再撤回');
   }
 
-  async #context(session) {
+  async #context(session, { optional = false } = {}) {
     if (!session?.id) throw new StateError('当前没有可操作的会话');
-    const port = await this.#portFor(session);
     const cwd = await this.#cwdOf(session);
-    if (!cwd) throw new StateError('会话没有本地工作目录');
+    if (!cwd) {
+      if (optional) return undefined;
+      throw new StateError('会话没有本地工作目录');
+    }
     const hasGit = await this.#hasGit(cwd);
-    const snapshot = hasGit ? await this.#snapshotFor(cwd) : unavailableSnapshot();
-    const root = workspaceDirectory(this.#root, cwd);
-    const recorder = new SnapshotRecorder({ snapshot, root, sessionId: session.id, scope: this.#scope });
-    const revert = new RevertService({ snapshot, session: port, root });
-    return { port, cwd, snapshot, root, recorder, revert, hasGit };
+    const snapshot = hasGit ? await this.#snapshotFor(cwd) : undefined;
+    return { cwd, hasGit, snapshot, root: workspaceDirectory(this.#root, cwd) };
   }
 
-  /** Whether file snapshots are usable here; a missing git degrades to chat-only undo. */
+  async #captureTree(context) {
+    const captured = await this.#serialized(context.cwd, () => context.snapshot.capture({ scope: this.#scope }));
+    return captured?.tree;
+  }
+
   async #hasGit(cwd) {
-    if (!this.#git.has(cwd)) {
-      this.#git.set(cwd, this.#probeGit(cwd).catch(() => false));
-    }
+    if (!this.#git.has(cwd)) this.#git.set(cwd, this.#probeGit(cwd).catch(() => false));
     return this.#git.get(cwd);
   }
 
   async #snapshotFor(cwd) {
     if (!this.#snapshots.has(cwd)) {
-      const promise = this.#openSnapshot({ worktree: cwd, root: workspaceDirectory(this.#root, cwd) }).catch((error) => {
+      const pending = Promise.resolve(
+        this.#openSnapshot({
+          worktree: cwd,
+          root: workspaceDirectory(this.#root, cwd),
+        }),
+      ).catch((error) => {
         this.#snapshots.delete(cwd);
         throw error;
       });
-      this.#snapshots.set(cwd, promise);
+      this.#snapshots.set(cwd, pending);
     }
     return this.#snapshots.get(cwd);
   }
 
-  /** Serialize captures per worktree: the shadow index is one file. */
   async #serialized(cwd, run) {
     const previous = this.#queue.get(cwd) ?? Promise.resolve();
-    const next = previous.then(run, run);
+    const next = previous.then(() => run(), () => run());
     const tail = next.catch(() => {});
     this.#queue.set(cwd, tail);
     try {
@@ -201,31 +474,27 @@ export class RewindRuntime {
       if (this.#queue.get(cwd) === tail) this.#queue.delete(cwd);
     }
   }
+
+  /** Serialize every state-file mutation for one session. */
+  async #mutate(sessionId, run) {
+    const previous = this.#writes.get(sessionId) ?? Promise.resolve();
+    const step = async () => run(await readState(this.#root, sessionId));
+    const next = previous.then(step, step);
+    const tail = next.catch(() => {});
+    this.#writes.set(sessionId, tail);
+    try {
+      return await next;
+    } finally {
+      if (this.#writes.get(sessionId) === tail) this.#writes.delete(sessionId);
+    }
+  }
 }
 
 export function defaultRewindRoot() {
   return process.env.DSH_REWIND_HOME ?? join(process.env.USERPROFILE ?? process.env.HOME ?? '.', '.dsh', 'rewind');
 }
 
-export function messageText(event) {
-  const content = event?.data?.content;
-  if (!Array.isArray(content)) return '';
-  return content
-    .filter((block) => block?.type === 'text' && typeof block.text === 'string')
-    .map((block) => block.text)
-    .join('\n');
-}
-
-/**
- * Stand-in snapshot service when `git` is missing.
- *
- * Chat-only undo/redo never touches it; snapshot capture (pre-step recording)
- * fails loudly through the caller's own error handling, so the plugin keeps
- * working without git instead of blocking every turn.
- */
-function unavailableSnapshot() {
-  const fail = () => {
-    throw new SnapshotError('unavailable', 'git is not available; file snapshots are disabled');
-  };
-  return { capture: fail, files: fail, diff: fail, restore: fail, listTree: fail };
+function short(value, limit) {
+  const text = String(value ?? '').replace(/\s+/g, ' ').trim();
+  return text.length > limit ? `${text.slice(0, Math.max(0, limit - 1))}…` : text;
 }

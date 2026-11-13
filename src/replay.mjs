@@ -1,102 +1,155 @@
 /**
- * Id and position rewriting for redo copies.
+ * Build a replay of a conversation *inside an open turn and step*.
  *
- * A copied conversation must not reuse durable identities: `message.id` is the
- * message's stable identity, and tool-call ids pair an assistant's `tool-call`
- * blocks with the `tool/result` messages that answer them. DSH accepts
- * duplicate ids (verified by `scripts/verify-host.mjs`, Q7), but a client that
- * keys rendered rows by id would then collapse two turns into one.
+ * This is the whole difference between v5 and v6. A durable dsh log validates
+ * turn/step ownership (`@deepseek-ai/dsh-session-format-v3-to-v4` requires every
+ * `developer/message`, `assistant/message`, `tool/call` and `tool/result` to sit
+ * in an open turn+step, and `turn/start` to be exactly the next turn number), so
+ * a message appended after `turn/end` makes the session unreloadable.
  *
- * Copies also get a **replay turn namespace**. dsh-tui keys assistant rows by
- * `turn:step`; re-appending a turn with its original numbers would update the
- * row that is already on screen instead of drawing the restored conversation.
- * Turning the copied turns into a high, monotone range keeps them separate
- * from any future live turn (`turn` is just position metadata in a durable
- * event; no turn/step boundaries are copied).
+ * The runtime therefore borrows a real maintenance turn from the agent
+ * (`agent.runMaintenance()` + a steer marker) and calls this module from
+ * `agent/pre-step`, where the turn is open but no step exists yet. Everything
+ * this module returns is appended before the host loop appends `turn/end`.
  *
- * The rewrite is pure: the original events are never mutated, and every copy
- * gets fresh ids. Usage is dropped from copies so token accounting is not
- * counted twice.
+ * Construction rules:
+ *   1. a detached clone receives the events, so a rejected replay costs nothing;
+ *   2. `step/start` opens the borrowed step;
+ *   3. the *tail* of the current surface is hidden with one empty
+ *      `developer/message` replace marker (the only visibility primitive);
+ *   4. the desired messages are copied with fresh message ids and fresh
+ *      tool-call ids, `tool/call` rows are re-created for each call, assistant
+ *      `usage` is dropped, and every copy points at its origin;
+ *   5. `step/end` closes the step; the host loop appends `turn/end` itself.
  */
 import { randomUUID } from 'node:crypto';
+import { itemsOf, messageOf, commonPrefix } from './history.mjs';
 
-/** First turn number a replayed copy may use; far above any live turn. */
-export const REPLAY_TURN_BASE = 1_000_000;
+export class ReplayError extends Error {
+  constructor(message, cause) {
+    super(message);
+    this.name = 'ReplayError';
+    if (cause) this.cause = cause;
+  }
+}
 
 /**
- * Rewrite one redo segment for re-append.
+ * Build the events that replay `desired` in `turn`/`step`.
  *
- * @param events - hidden original events, in log order.
- * @param options.newId - id factory; injectable so tests are deterministic.
- * @param options.turnBase - first replay turn; defaults to {@link REPLAY_TURN_BASE}.
- * @returns detached `{ type, data, originSeq }` entries plus the id maps.
+ * @param session - the live session (only read).
+ * @param desired - message snapshots from `history.beforeSeq`.
+ * @param options.turn - the open maintenance turn.
+ * @param options.step - the step number to open (1 for a fresh turn).
+ * @param options.createDetached - `(session, events) => session-like`.
+ * @param options.validate - `(detachedSession) => void`; may throw.
+ * @returns `{ events, hidden }` — `events` still excludes `turn/end`.
  */
-export function rewriteForReplay(events, { newId = () => randomUUID(), turnBase } = {}) {
+export function buildReplay(session, desired, { turn, step = 1, createDetached, validate, newId = randomUUID } = {}) {
+  if (!Number.isSafeInteger(turn) || turn < 1) throw new ReplayError('replay needs the open turn number');
+  if (!Number.isSafeInteger(step) || step < 1) throw new ReplayError('replay needs a positive step number');
+  if (typeof createDetached !== 'function') throw new ReplayError('replay needs a detached session factory');
+  if (!Array.isArray(desired)) throw new ReplayError('replay needs a message snapshot');
+
+  const clone = createDetached(session, session.snapshotEvents());
+  const start = clone.seq;
+  clone.append('step/start', { turn, step });
+
+  const current = itemsOf(session);
+  const common = commonPrefix(desired, current);
+  const nodes = [...clone.surface.nodes];
+  const keptSeq = common > 0 ? current[common - 1].source : -1;
+  const tail = nodes.filter((seq) => seq > keptSeq);
+
+  // Tool-call ids of the *kept* prefix stay valid; only later calls are new.
   const calls = new Map();
-  const messages = new Map();
-  const prepared = [];
-
-  const call = (oldId) => {
-    if (!calls.has(oldId)) calls.set(oldId, newId());
-    return calls.get(oldId);
-  };
-
-  const turns = events.map((event) => event.data?.turn).filter((turn) => Number.isInteger(turn));
-  const minTurn = turns.length > 0 ? Math.min(...turns) : 0;
-  const base = Number.isSafeInteger(turnBase) ? turnBase : REPLAY_TURN_BASE;
-  const turnOf = (turn) => (Number.isInteger(turn) ? base + (turn - minTurn) : turn);
-
-  for (const event of events) {
-    const data = structuredClone(event.data);
-    switch (event.type) {
-      case 'user/message': {
-        messages.set(event.seq, data.id);
-        data.id = newId();
-        break;
-      }
-      case 'developer/message':
-      case 'system/message': {
-        messages.set(event.seq, data.message.id);
-        data.message.id = newId();
-        data.turn = turnOf(data.turn);
-        break;
-      }
-      case 'assistant/message': {
-        messages.set(event.seq, data.message.id);
-        data.message.id = newId();
-        data.turn = turnOf(data.turn);
-        // A replay is history, not a new model call: its usage must not be
-        // booked again by the token meter.
-        delete data.usage;
-        for (const block of data.message.content ?? []) {
-          if (block?.type === 'tool-call') block.id = call(block.id);
-        }
-        for (const record of data.stream ?? []) {
-          if (record?.type === 'tool-call-chunks' && typeof record.id === 'string') {
-            record.id = call(record.id);
-          } else if (record?.type === 'chunk' && record.chunk?.type === 'tool-call-delta') {
-            record.chunk.id = call(record.chunk.id);
-          }
-        }
-        break;
-      }
-      case 'tool/result': {
-        messages.set(event.seq, data.message.id);
-        const oldCall = data.message.toolCallId;
-        const nextCall = call(oldCall);
-        data.message.id = newId();
-        data.message.toolCallId = nextCall;
-        data.turn = turnOf(data.turn);
-        if (data.message.source?.kind === 'tool') data.message.source.callId = nextCall;
-        break;
-      }
-      default:
-        // Not a surface message (turn/step markers never reach here in redo);
-        // keep it untouched so a caller can still pass the whole segment.
-        break;
+  for (const item of desired.slice(0, common)) {
+    for (const block of messageOf(item).content ?? []) {
+      if (block?.type === 'tool-call') calls.set(block.id, block.id);
     }
-    prepared.push({ type: event.type, data, originSeq: event.seq });
   }
 
-  return { events: prepared, calls, messages };
+  const copy = structuredClone(desired.slice(common));
+  const copies = [];
+
+  // The system prompt opens the surface and carries the model's instructions;
+  // when the tail reaches it, replace it in place instead of hiding it.
+  const head = tail.length > 0 && tail[0] === nodes[0] && clone.eventAt(tail[0])?.type === 'system/message' ? tail.shift() : undefined;
+  if (head !== undefined) {
+    const system = copy[0]?.type === 'system/message' ? copy.shift() : null;
+    const message = system
+      ? system.data.message
+      : { id: newId(), role: 'system', source: { kind: 'system-prompt' }, content: [] };
+    clone.append(
+      'system/message',
+      { turn, step, message },
+      { surfaceOp: { op: 'replace', startSeq: head, endSeq: head }, sourceEventSeqs: [head] },
+    );
+  }
+
+  const hidden = tail.length > 0 ? { start: tail[0], end: tail.at(-1) } : null;
+  if (tail.length > 0) {
+    clone.append(
+      'developer/message',
+      { turn, step, message: { id: newId(), role: 'developer', source: { kind: 'dsh-tui-undo' }, content: [] } },
+      { surfaceOp: { op: 'replace', startSeq: tail[0], endSeq: tail.at(-1) }, sourceEventSeqs: tail },
+    );
+  }
+
+  // Fresh identities first, so a tool result can be re-pointed at the copy of
+  // the call that produced it.
+  for (const item of copy) {
+    const message = messageOf(item);
+    message.id = newId();
+    for (const block of message.content ?? []) {
+      if (block?.type !== 'tool-call') continue;
+      const fresh = `undo_${newId().replaceAll('-', '')}`;
+      calls.set(block.id, fresh);
+      block.id = fresh;
+    }
+    if (message.role === 'tool') {
+      if (!calls.has(message.toolCallId)) {
+        throw new ReplayError('这段历史里有找不到对应工具调用的结果，无法安全重放');
+      }
+      message.toolCallId = calls.get(message.toolCallId);
+      if (message.source?.callId) message.source.callId = message.toolCallId;
+    }
+  }
+
+  for (const item of copy) {
+    const data = structuredClone(item.data);
+    // Copy rows are tagged with the borrowed step: the durable log has no
+    // "which step did this belong to" concept for replayed history.
+    if (item.type !== 'user/message') {
+      data.turn = turn;
+      data.step = step;
+    }
+    const options = { surfaceOp: 'append' };
+    // assistant/message embeds its provider stream and rejects sourceEventSeqs.
+    if (item.type !== 'assistant/message' && Number.isSafeInteger(item.source)) {
+      options.sourceEventSeqs = [item.source];
+    }
+    clone.append(item.type, data, options);
+    // The copy owns a new sequence number but describes the same step as its
+    // origin: remember the mapping so the file plan can find that step later.
+    if (Number.isSafeInteger(item.source)) {
+      copies.push({ seq: clone.seq - 1, origin: item.source });
+    }
+    // A tool result must have a logged call lifecycle; the original call row is
+    // part of the replayed turn now, so it is re-created next to the copy.
+    if (item.type === 'assistant/message') {
+      for (const block of data.message.content ?? []) {
+        if (block?.type !== 'tool-call') continue;
+        clone.append('tool/call', { turn, step, callId: block.id, name: block.name, arguments: block.arguments });
+      }
+    }
+  }
+
+  clone.append('step/end', { turn, step });
+  const prepared = clone.snapshotEvents().slice(start);
+
+  // Prove the result decodes before the runtime commits anything: a rejected
+  // replay must leave the worktree and the log untouched.
+  clone.append('turn/end', { turn, reason: { kind: 'blocked' } });
+  if (typeof validate === 'function') validate(clone);
+  return { events: prepared, hidden, copies };
 }
