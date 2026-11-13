@@ -5,6 +5,11 @@
 > 定位：以插件形态实现 undo / redo，**不修改 dsh-tui 与 DSH 核心的源码**。
 > 路线：沿用 opencode v2 的**快照与回退语义**（消息快照、`seq` 边界、`stage / clear / commit`、选择式恢复），但把"可见性"从"UI 过滤"换成"**把事件移出会话日志**"。
 > 代价：redo 依赖插件侧的副本；这是不改宿主的必然结果。
+>
+> **⚠ v6 技术路线已重写：** v5 的“turn 外追加副本”会导致 reload 时
+> `SessionFormatError`，已被真机证实不可行。新的实现依据见
+> [`undo-redo-technical-route.md`](./undo-redo-technical-route.md)
+> （maintenance turn replay）。本文件保留作演进记录，不再作为实现依据。
 
 ---
 
