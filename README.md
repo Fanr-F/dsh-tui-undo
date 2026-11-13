@@ -6,31 +6,35 @@
 - `/redo`：把上一次撤回再放回去；
 - **重新加载会话永远不会坏**：重放的内容写在一个真实的回合（turn）里。
 
-## 原理（一句话）
-
-dsh 的会话日志是只追加的，并且持久化时严格校验「每条消息必须属于某个打开的
-turn + step」。所以插件**不伪造 turn、不截断日志、不 fork 会话**：它向 agent
-借一个真实的、不调用模型的维护回合（`agent.runMaintenance()` + 一条 steer 标记），
-在 `agent/pre-step` 里把目标对话重放成这个回合的一个 step，然后
-`return { kind: 'reject' }` 让模型不跑。回合号由 agent 自己递增，`turn/end`
-也由宿主追加，日志因此始终合法。
-
-可见性仍然只有一种手段：`surfaceOp: replace` 的隐藏标记。被替换掉的原始消息
-留在日志里，它们的 seq 永远有效，所以文件快照和「重做到哪一步」都能稳定引用。
+当前版本 **0.3.0**，发布页：<https://github.com/Fanr-F/dsh-tui-undo/releases>。
 
 ## 安装
 
-插件需要宿主已经加载的 `@deepseek-ai/dsh-session` 与格式校验目录。它是
-`link:` 安装，裸包名解析不到 profile 的 `node_modules`，所以运行时会按顺序查找：
+从发布页的 tarball 安装（推荐，版本固定）：
+
+```powershell
+dsh plugin --profile web add https://github.com/Fanr-F/dsh-tui-undo/releases/download/v0.3.0/dsh-tui-undo-0.3.0.tgz
+```
+
+或直接从 GitHub 仓库安装：
+
+```powershell
+dsh plugin --profile web add github:Fanr-F/dsh-tui-undo
+```
+
+本地开发用 `link:`：
+
+```powershell
+dsh plugin --profile web add link:D:/Code/dsh-tui-undo
+```
+
+插件运行时需要宿主已经加载的 `@deepseek-ai/dsh-session` 与格式校验目录。
+`link:` 安装时裸包名解析不到 profile 的 `node_modules`，所以会按顺序查找：
 
 1. 直接 `import` 包名（正常安装时可用）；
 2. `DSH_MODULE_ROOT` 或配置里的 `moduleRoot`；
 3. `$DSH_HOME/profiles/*/node_modules`；
 4. 全局 dsh 安装目录。
-
-```powershell
-dsh plugin --profile web add link:D:/Code/dsh-tui-undo
-```
 
 `package.json` 里带 `dsh.bundle.patch`，装完会自动出现在
 `dsh --profile web --dump-config` 的行列表里。
@@ -54,6 +58,14 @@ dsh-tui 里如果宿主提供 `tuiDialogs`，`/undo` 会弹出选择框；选完
   文件逐个还原；重做时还原这次撤回改动过的文件。
 - 没有 `git`：只回退对话，并在结果里说明。
 
+## 崩溃安全
+
+每次操作先写 journal（含计划中的状态和回滚所需的文件树），再恢复文件、追加日志、
+flush，最后在 `turn/end` 时落最终状态。进程被杀后，下一次 `agent/pre-step` 会：
+
+- 日志里已有 `plugin:dsh-tui-undo/commit` 标记 → 直接采用计划状态；
+- 否则回滚文件并清掉 journal。
+
 ## 日志
 
 插件自己写一份诊断日志，默认在 `~/.dsh/rewind/dsh-tui-undo.log`
@@ -65,13 +77,11 @@ dsh-tui 里如果宿主提供 `tuiDialogs`，`/undo` 会弹出选择框；选完
 - 撤回失败时错误文本里也会附上路径；
 - `node scripts/diagnose.mjs "<工作目录>"` 会把会话、state、影子仓库和日志一起打出来。
 
-## 崩溃安全
+## 兼容性
 
-每次操作先写 journal（含计划中的状态和回滚所需的文件树），再恢复文件、追加日志、
-flush，最后在 `turn/end` 时落最终状态。进程被杀后，下一次 `agent/pre-step` 会：
-
-- 日志里已有 `plugin:dsh-tui-undo/commit` 标记 → 直接采用计划状态；
-- 否则回滚文件并清掉 journal。
+- Node.js >= 22；
+- DSH `>= 0.2.2-rc.2 < 0.3.0`（在真实 rc.2 宿主上验证）；
+- 插件形态是 DSH bundle：宿主半边 + 可选的 web 客户端半边。
 
 ## 已知限制
 
@@ -89,11 +99,11 @@ flush，最后在 `turn/end` 时落最终状态。进程被杀后，下一次 `a
 ## 测试
 
 ```powershell
-npm test                    # 32 个测试，含真实 rc.2 的格式校验
+npm test                    # 62 个测试，含真实 rc.2 的格式校验
 npm run verify:replay       # 只跑真实宿主的重放/重载验证
 npm run verify:manifest     # dsh-plugin.json 校验
 ```
 
 `test/host-format.test.mjs` 直接调用安装版
 `@deepseek-ai/dsh-session` 与 `dsh-session-format-catalog`：它断言重放后的日志
-能被重新打开，同时断言 v5 那套「turn 外追加消息」的写法会被拒绝。
+能被重新打开，同时断言「turn/end 之后追加消息」的写法会被格式校验拒绝。
