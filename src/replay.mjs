@@ -87,7 +87,9 @@ export function buildReplay(session, desired, { turn, step = 1, createDetached, 
   }
 
   const hidden = tail.length > 0 ? { start: tail[0], end: tail.at(-1) } : null;
+  let marker;
   if (tail.length > 0) {
+    marker = clone.seq;
     clone.append(
       'developer/message',
       { turn, step, message: { id: newId(), role: 'developer', source: { kind: 'dsh-tui-undo' }, content: [] } },
@@ -151,5 +153,5 @@ export function buildReplay(session, desired, { turn, step = 1, createDetached, 
   // replay must leave the worktree and the log untouched.
   clone.append('turn/end', { turn, reason: { kind: 'blocked' } });
   if (typeof validate === 'function') validate(clone);
-  return { events: prepared, hidden, copies };
+  return { events: prepared, hidden, copies, marker };
 }

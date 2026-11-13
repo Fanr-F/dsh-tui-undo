@@ -5,6 +5,23 @@ import { RewindRuntime, defaultRewindRoot } from './runtime.mjs';
 export const name = 'dsh-tui-undo';
 export const inject = ['agents', 'sessions'];
 
+const json = (response, status, value) => {
+  if (response.writableEnded) return;
+  response.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+  response.end(JSON.stringify(value));
+};
+
+async function readJson(request) {
+  let size = 0;
+  const parts = [];
+  for await (const part of request) {
+    size += part.length;
+    if (size > 64 * 1024) throw new Error('请求过大');
+    parts.push(part);
+  }
+  return JSON.parse(Buffer.concat(parts).toString('utf8') || '{}');
+}
+
 /**
  * dsh plugin entry.
  *
@@ -47,6 +64,35 @@ export async function install(ctx, config = {}) {
 
   ctx.on('agent/pre-step', (payload, next) => runtime.preStep(payload, next), { prepend: true });
   ctx.on('session/event', (session, event) => runtime.event(session, event));
+
+  // The web client asks for `hiddenRanges` here; a host without a web server
+  // (dsh-tui) simply never resolves these services.
+  ctx.inject(['webServer', 'connection'], (scope) => {
+    scope.effect(() =>
+      scope.webServer.register({
+        kind: 'exact',
+        path: '/api/dsh-tui-undo/state',
+        handler: async (request, response) => {
+          const rejection = scope.connection.requestRejection(request);
+          if (rejection !== undefined) {
+            response.writeHead(rejection);
+            response.end();
+            return;
+          }
+          if (request.method !== 'POST') {
+            json(response, 405, { error: 'POST required' });
+            return;
+          }
+          try {
+            const body = await readJson(request);
+            json(response, 200, await runtime.stateFor(body.sessionId));
+          } catch (error) {
+            json(response, 409, { error: error?.message ?? String(error) });
+          }
+        },
+      }),
+    );
+  });
 
   ctx.inject(['commands'], (scope) => {
     const commands = createCommands({ runtime, dialogs: () => ctx.get?.('tuiDialogs') });

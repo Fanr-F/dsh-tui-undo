@@ -1,6 +1,6 @@
 # undo / redo 技术路线（v6）
 
-> 状态：M0–M2 已实现并在真实 rc.2 上验证；M3（web 客户端隐藏）待做
+> 状态：M0–M3 已实现并在真实 rc.2 上验证；M4（打磨）待做
 > 日期：2026-11-13
 > 目标平台：**dsh web 优先**；dsh-tui 暂不作为验收目标
 > 参考实现：`D:\Code\dsh-undo-plugin`（MIT，只借鉴机制，不复制代码）
@@ -361,6 +361,7 @@ commands (/undo /redo)
 | `src/store.mjs` | schema 2：`snapshots`/`copies`/`view`/`undo`/`redo`/`hiddenRanges`/`internalRanges`/`journal` |
 | `src/runtime.mjs` | maintenance 编排、pre-step 拦截、turn/end 收尾、崩溃恢复 |
 | `src/commands.mjs` | `/undo`（列表或 `编号`）、`/redo`；TUI 有 dialogs 时用选择框 |
+| `lib/client.js` | web 客户端：拉取 `hiddenRanges`，包裹 `conversation.chat.flow` 过滤行 |
 | `src/timeline.mjs` | 文件计划（按 step 的 `start` 树回填），保留 |
 
 ### 16.2 与设计稿的差异
@@ -390,9 +391,29 @@ commands (/undo /redo)
 - `test/replay.test.mjs` 覆盖重复 id、tool-call/result 配对、usage 剥离、
   空目标。
 
-### 16.4 仍未做（M3/M4）
+### 16.4 M3：web 客户端隐藏（已完成）
 
-- web 客户端按 `hiddenRanges` / 维护回合隐藏行（当前界面仍按追加顺序显示原始消息）；
-- dsh-tui 转录层；性能与并发压测；旧 PRD 的迁档清理。
+- host 半边新增 `POST /api/dsh-tui-undo/state`（`{sessionId}` →
+  `hiddenRanges/internalRanges/undoAvailable/redoAvailable/view`），走
+  `ctx.inject(['webServer','connection'])`，与宿主同源鉴权。
+- `lib/client.js` 是手写的浏览器模块（`window.__ModuleLoader__.load` +
+  CommonJS `require('react')`），随包通过 `exports["./client"]` 与
+  `dsh.client` 发布：
+  - 拉取 state，并在会话事件增长后防抖刷新；
+  - 包裹 `conversation.chat.flow`：按 `entries`/`useChatGroup` 过滤
+    `hiddenRanges` 命中的节点；
+  - `conversation.chat.flow` 是 `single` 槽且宿主没有公开的 wrap API，所以
+    就地替换 ledger 行的 `component`，再注册一个高优先级的空探针来发布版本
+    （`single` 槽最低优先级渲染，探针不会被选中）。
+- 隐藏标记本身（空 `developer/message`）的 seq 也并入 `hiddenRanges`，
+  避免 UI 画出一个空行。
+- 验证：`dsh --profile web --dump-config` 有插件行；boot manifest 里能看到
+  `plugins/??dsh-tui-undo/client.js`；`/api/dsh-tui-undo/state` 带浏览器会话
+  返回 200；`test/client.test.mjs` 用假 loader/React/槽位验证替换、过滤与还原。
+
+### 16.5 仍未做（M4）
+
+- dsh-tui 转录层；turn rail / 大纲里的隐藏回合过滤；性能与并发压测；
+  旧 PRD 的迁档清理。
 
 

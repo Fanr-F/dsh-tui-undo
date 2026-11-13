@@ -64,11 +64,10 @@ flush，最后在 `turn/end` 时落最终状态。进程被杀后，下一次 `a
 
 ## 已知限制
 
-- **Web 界面的转录仍按追加顺序渲染**，`surface` 的隐藏只在模型上下文和 token
-  计量里生效。因此撤回后界面上仍能看到被隐藏的原始消息，重做后会同时看到副本。
-  客户端隐藏（按 state 的 `hiddenRanges` 过滤）是下一步 M3，见
-  `prd/undo-redo-technical-route.md`。
-- dsh-tui 的转录同样不读 surface，界面回退未处理。
+- 界面上隐藏旧行依赖随包发布的 web 客户端（`dsh.client`）：它按 state 里的
+  `hiddenRanges` 过滤 `conversation.chat.flow`。只装 host 半边时，模型上下文和
+  文件仍然正确，但转录里还能看到被替换的旧行。
+- dsh-tui 的转录不读 surface，也没有对应客户端，界面回退未处理。
 - 不撤销外部副作用（发送的消息、网页操作、数据库写入）。
 - 会话正在生成、或同一工作区有别的会话在操作时，撤回会被拒绝。
 

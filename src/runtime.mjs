@@ -122,8 +122,27 @@ export class RewindRuntime {
     }));
   }
 
-  async status(session) {
-    const state = await readState(this.#root, session.id);
+  /**
+   * What a UI needs to hide rewind rows, addressable by session id alone.
+   *
+   * The web client asks for this after every commit marker, so it must not
+   * resume an agent or require an open session.
+   */
+  async stateFor(sessionId) {
+    if (typeof sessionId !== 'string' || !sessionId) throw new StateError('缺少会话 id');
+    const state = await readState(this.#root, sessionId);
+    return {
+      revision: state.revision,
+      hiddenRanges: state.hiddenRanges,
+      internalRanges: state.internalRanges,
+      undoAvailable: state.undo.length > 0,
+      redoAvailable: state.redo.length > 0,
+      view: state.view,
+      busy: Boolean(state.journal),
+    };
+  }
+
+  async status(session) {    const state = await readState(this.#root, session.id);
     const context = await this.#context(session, { optional: true });
     return {
       undoAvailable: state.undo.length > 0,
@@ -230,7 +249,7 @@ export class RewindRuntime {
     const cut = operation.op === 'undo' ? operation.entry.targetSeq : operation.entry.beforeSeq;
     const desired = beforeSeq(session, cut, { createDetached: this.#host.createDetached });
     const start = session.seq;
-    const { events, copies } = buildReplay(session, desired, {
+    const { events, copies, marker } = buildReplay(session, desired, {
       turn,
       step: 1,
       createDetached: this.#host.createDetached,
@@ -245,6 +264,12 @@ export class RewindRuntime {
     const endSeq = start + events.length + 1;
     const internal = { start, end: endSeq + 1 };
     const hiddenRange = { start: cut, end: Math.max(cut, start - 1) };
+    // The hide marker is a surface row with no content; the UI must not draw it.
+    const hiddenRanges = mergeRanges([
+      ...state.hiddenRanges,
+      hiddenRange,
+      ...(Number.isSafeInteger(marker) ? [{ start: marker, end: marker }] : []),
+    ]);
     let next;
     if (operation.op === 'undo') {
       next = {
@@ -253,7 +278,7 @@ export class RewindRuntime {
         redo: [],
         copies: picture,
         view: { cut },
-        hiddenRanges: mergeRanges([...state.hiddenRanges, hiddenRange]),
+        hiddenRanges,
         internalRanges: mergeRanges([...state.internalRanges, internal]),
       };
     } else {
@@ -263,7 +288,7 @@ export class RewindRuntime {
         redo: [...state.redo, operation.entry],
         copies: picture,
         view: { cut: null },
-        hiddenRanges: mergeRanges([...state.hiddenRanges, hiddenRange]),
+        hiddenRanges,
         internalRanges: mergeRanges([...state.internalRanges, internal]),
       };
     }
