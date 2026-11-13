@@ -87,11 +87,13 @@ test('/undo uses the picker when the host provides dialogs', async () => {
   assert.deepEqual(calls.undo, [20]);
 });
 
-test('/undo cancels silently when the picker is dismissed', async () => {
+test('/undo cancels with visible feedback when the picker is dismissed', async () => {
   const { runtime, calls } = fakeRuntime();
   const commands = createCommands({ runtime, dialogs: () => ({ select: async () => undefined }) });
   const result = await commands.undo(invocation(''));
-  assert.deepEqual(result, { kind: 'success', text: '' });
+  assert.equal(result.kind, 'success');
+  assert.match(result.text, /已取消/);
+  assert.match(result.text, /\/undo 1/);
   assert.deepEqual(calls.undo, []);
 });
 

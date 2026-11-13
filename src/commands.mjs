@@ -11,7 +11,10 @@ const DIALOG_TIMEOUT_MS = 5 * 60 * 1000;
 
 const errorText = (error) => (error instanceof Error ? error.message : String(error));
 const fail = (text) => ({ kind: 'error', text: text || '操作失败' });
-const cancelled = () => ({ kind: 'success', text: '' });
+const cancelled = (targets) => ({
+  kind: 'success',
+  text: `已取消（${targets?.length ?? 0} 个候选，可用 /undo 1 直接回退最近一条）。`,
+});
 
 function short(value, limit) {
   const text = String(value ?? '').replace(/\s+/g, ' ').trim();
@@ -26,12 +29,19 @@ function fileSummary(result) {
   return `恢复了 ${changed} 个文件${failed ? `（${failed} 个失败）` : ''}`;
 }
 
-export function createCommands({ runtime, dialogs }) {
+export function createCommands({ runtime, dialogs, logger }) {
   const dialogService = () => {
     try {
       return dialogs?.();
     } catch {
       return undefined;
+    }
+  };
+  const note = (message) => {
+    try {
+      logger?.(message);
+    } catch {
+      /* logging must never break the command */
     }
   };
 
@@ -66,6 +76,7 @@ export function createCommands({ runtime, dialogs }) {
     } catch (error) {
       return fail(errorText(error));
     }
+    note(`/undo：${targets.length} 个候选`);
     if (!targets.length) return fail('还没有可回退的用户消息');
 
     const argument = String(invocation?.rawInput ?? invocation?.input ?? '').trim();
@@ -88,13 +99,15 @@ export function createCommands({ runtime, dialogs }) {
             label: target.label,
             description: `第 ${targets.length - index} 近的一条消息`,
           })),
-          signal: invocation.signal,
+          // Deliberately no `signal`: a command signal that is already aborted
+          // would settle the dialog instantly with "cancelled" and the command
+          // would look like it did nothing.
           timeoutMs: DIALOG_TIMEOUT_MS,
         });
       } catch (error) {
         return fail(errorText(error));
       }
-      if (choice === undefined) return cancelled();
+      if (choice === undefined || choice === null) return cancelled(targets);
       const target = targets[Number.parseInt(choice, 10) - 1];
       if (!target) return fail('这条消息已经不在当前对话中');
       return apply(invocation.agent, target);
@@ -104,13 +117,15 @@ export function createCommands({ runtime, dialogs }) {
   }
 
   async function apply(agent, target) {
+    note(`/undo：回退到 seq ${target.seq}`);
     try {
-      const result = await runtime.undo({ agent, seq: target.seq });
+      const result = await withDeadline(runtime.undo({ agent, seq: target.seq }));
       return {
         kind: 'success',
         text: `已回退到「${short(target.text, 40) || '（附件消息）'}」之前：${fileSummary(result)}。可用 /redo 重做。`,
       };
     } catch (error) {
+      note(`/undo 失败：${errorText(error)}`);
       return fail(errorText(error));
     }
   }
@@ -118,13 +133,31 @@ export function createCommands({ runtime, dialogs }) {
   async function redo(invocation) {
     const agent = invocation?.agent;
     if (!agent?.session?.id) return fail('当前没有可操作的会话');
+    note('/redo：执行');
     try {
-      const result = await runtime.redo({ agent });
+      const result = await withDeadline(runtime.redo({ agent }));
       return { kind: 'success', text: `已重做上一次回退：${fileSummary(result)}。` };
     } catch (error) {
+      note(`/redo 失败：${errorText(error)}`);
       return fail(errorText(error));
     }
   }
 
   return { undo, redo };
+}
+
+/** Turn a hung maintenance turn into visible feedback instead of silence. */
+async function withDeadline(promise, ms = 60_000) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${ms / 1000} 秒内没有完成，请稍后查看结果或用 /redo 检查`)), ms);
+        timer.unref?.();
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
 }

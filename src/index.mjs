@@ -95,7 +95,11 @@ export async function install(ctx, config = {}) {
   });
 
   ctx.inject(['commands'], (scope) => {
-    const commands = createCommands({ runtime, dialogs: () => ctx.get?.('tuiDialogs') });
+    const commands = createCommands({
+      runtime,
+      dialogs: () => ctx.get?.('tuiDialogs'),
+      logger: (message) => ctx.logger?.warn?.(`dsh-tui-undo ${message}`),
+    });
     const rows = [
       ['undo', '回退到之前的某条消息（可重做）', commands.undo, { hint: '编号；不带编号会列出可回退的消息' }],
       ['redo', '重做上一次回退', commands.redo],
