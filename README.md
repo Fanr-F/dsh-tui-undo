@@ -103,6 +103,7 @@ Web 输入框里：
 /undo          列出可回退的消息（最近的在最前，第一条也算目标）
 /undo 2        立刻回退到第 2 条之前
 /redo          重做上一次回退
+/undo-context  查看最近一次提交给模型的内容
 ```
 
 dsh-tui 里如果宿主提供 `tuiDialogs`，`/undo` 会弹出选择框；选完立即生效，
@@ -132,6 +133,16 @@ flush，最后在 `turn/end` 时落最终状态。进程被杀后，下一次 `a
 - `/undo-status` 会打印日志路径；
 - 撤回失败时错误文本里也会附上路径；
 - `node scripts/diagnose.mjs "<工作目录>"` 会把会话、state、影子仓库和日志一起打出来。
+
+### 模型输入日志
+
+每次真实步骤的 `agent/pre-step` 会记一份「即将提交给模型的完整消息列表」：
+
+- 磁盘：`~/.dsh/rewind/context/<session>.jsonl`，一行一次请求，含角色、字符数、每条消息的文本（长文本会截断，默认每条约 8000 字符）；
+- 命令：`/undo-context` 打印最近一次的摘要，并给出文件路径；
+- 开关：`config.contextLog = false` 关闭，`config.contextLimit = <字符数>` 调整截断长度。
+
+撤回后对比两次 `/undo-context` 的输出，就能直接看到模型上下文少了哪几轮。
 
 ## 兼容性
 

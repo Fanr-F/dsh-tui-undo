@@ -69,6 +69,8 @@ export async function install(ctx, config = {}) {
     flush: async (session) => ctx.sessions?.flush?.(session),
     logger: ctx.logger,
     scope: config.scope ?? '.',
+    contextLog: config.contextLog,
+    contextLimit: config.contextLimit,
   });
 
   ctx.effect(() => () => runtime.dispose?.());
@@ -122,6 +124,7 @@ export async function install(ctx, config = {}) {
       ['undo', '回退到之前的某条消息（可重做）', commands.undo, { hint: '编号；不带编号会列出可回退的消息' }],
       ['redo', '重做上一次回退', commands.redo],
       ['undo-status', '查看撤回插件状态（自检）', commands.status],
+      ['undo-context', '查看最近一次提交给模型的内容', commands.context],
     ];
     for (const [command, description, handler, input] of rows) {
       scope.effect(() => {

@@ -166,6 +166,37 @@ export function createCommands({ runtime, dialogs, logger, log }) {
     return file ? `${text}\n（详细日志：${file}）` : text;
   }
 
+  /** Show the last message list the host submitted to the model. */
+  async function context(invocation) {
+    const session = invocation?.agent?.session;
+    if (!session?.id) return fail('当前没有可操作的会话');
+    const path = runtime.contextPath(session.id);
+    if (!path) return fail('提交内容日志未启用（config.contextLog = false）');
+    let last;
+    try {
+      last = await runtime.lastContext(session.id);
+    } catch (error) {
+      return fail(errorText(error));
+    }
+    if (!last) {
+      return {
+        kind: 'success',
+        text: `还没有记录到提交给模型的内容。\n下一次请求之后会写入：${path}`,
+      };
+    }
+    const time = new Date(last.at ?? Date.now()).toLocaleString('zh-CN');
+    const lines = [
+      `最近一次提交给模型的内容（${time}，回合 ${last.turn ?? '?'}，会话 seq ${last.seq ?? '?'}）：`,
+      `共 ${last.count} 条消息、${last.chars} 字符；完整 JSONL：${path}`,
+      '',
+      ...last.messages
+        .slice(0, 12)
+        .map((message, index) => `${index + 1}. [${message.role}] ${short(message.text, 120) || '（空）'}`),
+    ];
+    if (last.messages.length > 12) lines.push(`… 另有 ${last.messages.length - 12} 条，见文件`);
+    return { kind: 'success', text: lines.join('\n') };
+  }
+
   /** Self-check: what the plugin thinks it can do in this session. */
   async function status(invocation) {
     const session = invocation?.agent?.session;
@@ -184,6 +215,7 @@ export function createCommands({ runtime, dialogs, logger, log }) {
           `可回退的消息：${targets.length} 条`,
           `撤回栈：${info.undoDepth} 次，可重做：${info.redoDepth} 次`,
           `日志：${runtime.logFile ?? '未启用'}`,
+          `提交内容日志：${runtime.contextDirectory ?? '未启用'}`,
           info.busy ? '注意：有未完成的撤回记录' : '状态：空闲',
         ].join('\n'),
       };
@@ -192,7 +224,7 @@ export function createCommands({ runtime, dialogs, logger, log }) {
     }
   }
 
-  return { undo, redo, status };
+  return { undo, redo, status, context };
 }
 
 /** Turn a hung maintenance turn into visible feedback instead of silence. */

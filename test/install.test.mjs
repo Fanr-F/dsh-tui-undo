@@ -57,7 +57,7 @@ test('a TUI-shaped host mounts the plugin and its commands', async () => {
   });
   await install(context, { storageDir: 'D:\\tmp\\dsh-undo-install-test', log: false });
 
-  assert.deepEqual([...commands.keys()].sort(), ['redo', 'undo', 'undo-status']);
+  assert.deepEqual([...commands.keys()].sort(), ['redo', 'undo', 'undo-context', 'undo-status']);
   assert.equal(typeof listeners.get('agent/pre-step'), 'function');
   assert.equal(typeof listeners.get('session/event'), 'function');
 });

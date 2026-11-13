@@ -2,3 +2,4 @@
 node_modules/
 /prd/
 .pnpm-store
+/dsh-tui-undo-*.tgz

@@ -7,6 +7,7 @@ import { beforeSeq, mergeRanges, userTargets } from './history.mjs';
 import { buildReplay } from './replay.mjs';
 import { plan as filePlan } from './timeline.mjs';
 import { workspaceDirectory } from './paths.mjs';
+import { createContextLog, describeInput, summarizeInput } from './context.mjs';
 import { describeError } from './log.mjs';
 
 /**
@@ -34,6 +35,8 @@ export class RewindRuntime {
   #openSnapshot;
   #logger;
   #log;
+  #contextLog;
+  #contextLimit;
   #scope;
   #snapshots = new Map();
   #git = new Map();
@@ -44,7 +47,7 @@ export class RewindRuntime {
   #ops = new Map();
   #recovered = new Set();
 
-  constructor({ root, host, cwdOf, flush, logger, scope = '.', probeGit = gitAvailable, openSnapshot, log } = {}) {
+  constructor({ root, host, cwdOf, flush, logger, scope = '.', probeGit = gitAvailable, openSnapshot, log, contextLog = true, contextLimit = 8000 } = {}) {
     if (!root || !host || !cwdOf) throw new TypeError('RewindRuntime needs root, host and cwdOf');
     this.#root = root;
     this.#host = host;
@@ -55,6 +58,9 @@ export class RewindRuntime {
     this.#logger = logger ?? { warn() {}, info() {} };
     this.#scope = scope;
     this.#log = log ?? { file: null, write() {}, async flush() {}, async tail() { return ''; } };
+    this.#contextLimit = Number.isSafeInteger(contextLimit) && contextLimit > 0 ? contextLimit : 8000;
+    this.#contextLog =
+      contextLog === false ? null : createContextLog({ directory: join(root, 'context'), limit: this.#contextLimit });
   }
 
   #trace(scope, message, data) {
@@ -70,6 +76,34 @@ export class RewindRuntime {
     return this.#log.file ?? null;
   }
 
+  /** Where the recorded model inputs live (`null` when disabled). */
+  get contextDirectory() {
+    return this.#contextLog?.directory ?? null;
+  }
+
+  contextPath(sessionId) {
+    return this.#contextLog?.pathOf(sessionId) ?? null;
+  }
+
+  async lastContext(sessionId) {
+    return this.#contextLog ? this.#contextLog.last(sessionId) : null;
+  }
+
+  /**
+   * Record the message list the host is about to submit.
+   *
+   * `agent/pre-step` receives the assembled next-step input, which is exactly
+   * what a rewind is supposed to change: `/undo-context` reads the last record
+   * so the difference is visible without a debugger.
+   */
+  async #recordContext(session, messages, turn) {
+    if (!this.#contextLog) return;
+    const described = describeInput(messages, { limit: this.#contextLimit });
+    const entry = { at: Date.now(), turn: turn ?? null, seq: session.seq, ...described };
+    await this.#contextLog.write(session.id, entry);
+    this.#trace('context', summarizeInput(described), { turn });
+  }
+
   /** `agent/pre-step`: capture for a live step, or rewrite from a maintenance turn. */
   async preStep({ agent, messages = [], turn } = {}, next) {
     const session = agent?.session;
@@ -82,6 +116,7 @@ export class RewindRuntime {
     try {
       await this.#ensureRecovered(session);
       await this.checkpoint(session, messages);
+      await this.#recordContext(session, messages, turn);
       await this.capture(session);
     } catch (error) {
       this.#trace('prestep', 'capture failed', describeError(error));
