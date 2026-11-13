@@ -213,6 +213,8 @@ export function createCommands({ runtime, dialogs, logger, log }) {
     }
     if (!surface && !incoming) {
       lines.push(
+        '（这条记录由旧版本写入，只有本步输入；重启宿主后再发一条消息，就会看到 surface / incoming 两段。）',
+        '',
         ...last.messages
           .slice(0, 12)
           .map((message, index) => `${index + 1}. [${message.role}] ${short(message.text, 100) || '（空）'}`),
