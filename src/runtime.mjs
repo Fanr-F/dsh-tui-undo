@@ -248,48 +248,33 @@ export class RewindRuntime {
 
     const cut = operation.op === 'undo' ? operation.entry.targetSeq : operation.entry.beforeSeq;
     const desired = beforeSeq(session, cut, { createDetached: this.#host.createDetached });
-    const start = session.seq;
-    const { events, copies, marker } = buildReplay(session, desired, {
+    // Dry run: prove the replay decodes *before* the journal and the files move.
+    // The real build happens again right before the append, so a host that
+    // records its own bookkeeping events during the awaits below cannot shift
+    // our sequence numbers; only the ranges are settled at `turn/end`.
+    const preview = buildReplay(session, desired, {
       turn,
       step: 1,
       createDetached: this.#host.createDetached,
       validate: this.#host.validate,
     });
-    if (!events.length) throw new StateError('没有可重放的内容');
+    if (!preview.events.length) throw new StateError('没有可重放的内容');
 
     const restore = operation.useFiles && context?.hasGit ? this.#restorePlan(operation, state, session, cut) : new Map();
-    const picture = { ...(state.copies ?? {}) };
-    for (const entry of copies) picture[entry.seq] = entry.origin;
-    // The marker row and the host's `turn/end` both land after our events.
-    const endSeq = start + events.length + 1;
-    const internal = { start, end: endSeq + 1 };
-    const hiddenRange = { start: cut, end: Math.max(cut, start - 1) };
-    // The hide marker is a surface row with no content; the UI must not draw it.
-    const hiddenRanges = mergeRanges([
-      ...state.hiddenRanges,
-      hiddenRange,
-      ...(Number.isSafeInteger(marker) ? [{ start: marker, end: marker }] : []),
-    ]);
     let next;
     if (operation.op === 'undo') {
       next = {
         ...state,
-        undo: [...state.undo, { ...operation.entry, endSeq }],
+        undo: [...state.undo, { ...operation.entry }],
         redo: [],
-        copies: picture,
         view: { cut },
-        hiddenRanges,
-        internalRanges: mergeRanges([...state.internalRanges, internal]),
       };
     } else {
       next = {
         ...state,
         undo: state.undo.slice(0, -1),
         redo: [...state.redo, operation.entry],
-        copies: picture,
         view: { cut: null },
-        hiddenRanges,
-        internalRanges: mergeRanges([...state.internalRanges, internal]),
       };
     }
 
@@ -297,7 +282,7 @@ export class RewindRuntime {
       id: operation.entry.id,
       op: operation.op,
       turn,
-      startSeq: start,
+      startSeq: session.seq,
       state: { ...next, journal: null },
       rollback: { head: operation.entry.head ?? null, files: [...restore.keys()] },
     };
@@ -307,10 +292,22 @@ export class RewindRuntime {
     });
 
     let restored;
+    let start;
+    let events;
+    let copies;
+    let marker;
     try {
       if (restore.size) restored = await context.snapshot.restore(restore);
+      // Rebuild against the live session, then append synchronously: from here
+      // to the last `append` there is no await, so the numbering cannot drift.
+      start = session.seq;
+      ({ events, copies, marker } = buildReplay(session, desired, {
+        turn,
+        step: 1,
+        createDetached: this.#host.createDetached,
+        validate: this.#host.validate,
+      }));
       for (const event of events) {
-        if (session.seq !== event.seq) throw new StateError('会话在撤回过程中发生了变化，请重新试一次');
         const options = {};
         if (event.surfaceOp !== undefined) options.surfaceOp = event.surfaceOp;
         if (event.sourceEventSeqs) options.sourceEventSeqs = event.sourceEventSeqs;
@@ -331,7 +328,43 @@ export class RewindRuntime {
       throw error;
     }
 
-    return { files: restore.size, restored, view: next.view, endSeq };
+    // `turn/end` returns the real end sequence; ranges are settled there.
+    operation.settlement = { cut, start, marker, copies, journalStart: journal.startSeq };
+    return { files: restore.size, restored, view: next.view };
+  }
+
+  /**
+   * Fold the operation's real sequence numbers into the planned state.
+   *
+   * `turn/end` is the first moment the final sequence is known: the host may
+   * append its own records between our build and our append, so ranges and
+   * `endSeq` are settled here rather than predicted.
+   */
+  #settle(planned, operation, endSeq) {
+    const settlement = operation.settlement;
+    if (!settlement) return { ...planned, journal: null };
+    const copies = { ...(planned.copies ?? {}) };
+    for (const entry of settlement.copies ?? []) copies[entry.seq] = entry.origin;
+    const hiddenRanges = mergeRanges([
+      ...(planned.hiddenRanges ?? []),
+      { start: settlement.cut, end: Math.max(settlement.cut, settlement.start - 1) },
+      ...(Number.isSafeInteger(settlement.marker) ? [{ start: settlement.marker, end: settlement.marker }] : []),
+    ]);
+    const turnStart = Number.isSafeInteger(operation.start) ? operation.start : settlement.journalStart;
+    const next = {
+      ...planned,
+      journal: null,
+      copies,
+      hiddenRanges,
+      internalRanges: mergeRanges([...(planned.internalRanges ?? []), { start: turnStart, end: endSeq }]),
+    };
+    if (operation.op === 'undo' && next.undo.length > 0) {
+      next.undo = [...next.undo.slice(0, -1), { ...next.undo.at(-1), endSeq }];
+    }
+    if (operation.op === 'redo' && next.redo.length > 0) {
+      next.redo = [...next.redo.slice(0, -1), { ...next.redo.at(-1), endSeq }];
+    }
+    return next;
   }
 
   async #finish(session, operation, event) {
@@ -344,7 +377,7 @@ export class RewindRuntime {
           state = current;
           return current;
         }
-        state = await writeState(this.#root, { ...planned, journal: null });
+        state = await writeState(this.#root, this.#settle(planned, operation, event.seq));
         return state;
       });
       if (operation.error) operation.reject(operation.error);

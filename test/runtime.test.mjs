@@ -131,6 +131,52 @@ test('a new message after an undo makes redo unavailable', async () => {
   }
 });
 
+test('a host event recorded mid-operation does not break the replay', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-undo-runtime-race-'));
+  const session = new FakeSession();
+  const files = new MemorySnapshot({ 'a.txt': 'a1' });
+  // The host appends its own bookkeeping row while the operation is running
+  // (real hosts do: command records, inbox splices, plugin records). The
+  // replay must be rebuilt against the live log instead of failing a seq check.
+  const snapshot = {
+    capture: (...args) => files.capture(...args),
+    files: (...args) => files.files(...args),
+    restore: async (map) => {
+      session.append('todo/write', { todos: [{ text: 'host bookkeeping', status: 'pending' }] });
+      return files.restore(map);
+    },
+  };
+  const runtime = new RewindRuntime({
+    root,
+    host: {
+      available: true,
+      createDetached: detached,
+      appendPluginRecord: (target, type, data) => target.append(type, data),
+    },
+    cwdOf: async () => 'D:/work',
+    flush: async () => {},
+    probeGit: async () => true,
+    openSnapshot: async () => snapshot,
+  });
+  session.listeners.push((target, event) => runtime.event(target, event));
+  const agent = new FakeAgent(session, { preStep: (payload, next) => runtime.preStep(payload, next) });
+  try {
+    const turns = await seed(agent, files);
+    await runtime.settle();
+    await runtime.undo({ agent, seq: turns[1].userSeq });
+    await runtime.settle();
+
+    const reloaded = new FakeSession({ log: session.snapshotEvents() });
+    assert.deepEqual(texts(reloaded), ['one', 'answer 1']);
+    const state = await readState(root, session.id);
+    assert.equal(state.journal, null);
+    assert.equal(state.undo.length, 1);
+    assert.ok(state.undo[0].endSeq > 0, 'the real turn/end sequence is recorded');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test('undo rejects a target that is not on the surface', async () => {
   const { files, runtime, agent, dispose } = await setup();
   try {
