@@ -417,13 +417,12 @@ commands (/undo /redo)
   --dump-config` 有行），`agents` / `sessions` / `commands` / `agent/pre-step` /
   `runMaintenance` 都在；`/undo` `/undo <n>` `/redo`、文件恢复、重新加载与 web
   完全同一条路径。`tuiDialogs` 存在时会走选择框。
-- **界面层不兼容**：dsh-tui 的转录由 `projectChannelRows(channel.rows)` 按追加
-  顺序生成，整个 lib 不读 `surface.nodes`（只有一下 fork/migration 路径用到
-  `surfaceOp`），也没有行过滤服务（`tuiMessageObserver` 是只读外发观察器，
-  `tuiRenderers`/`tuiScenes` 是面板不是转录）。因此撤回后旧回复仍留在屏幕上，
-  重做后会出现副本。
-- 要做到界面回退，需要改 dsh-tui 的转录层（或它自己提供过滤钩子），不在本插件
-  范围；需要界面反馈时用 dsh-tui 原生 `/rewind`（fork 式，不恢复文件）。
+- **界面层：不做（已确认的范围边界）**。dsh-tui 的转录由
+  `projectChannelRows(channel.rows)` 按追加顺序生成，整个 lib 不读
+  `surface.nodes`（只有 fork/migration 路径用到 `surfaceOp`），也没有行过滤
+  服务（`tuiMessageObserver` 是只读外发观察器，`tuiRenderers`/`tuiScenes` 是
+  面板不是转录）。撤回后旧回复仍留在屏幕上、重做后出现副本，这是接受的现状；
+  需要界面反馈时用 dsh-tui 原生 `/rewind`（fork 式，不恢复文件）或改用 web。
 
 ### 16.6 仍未做（M4）
 
