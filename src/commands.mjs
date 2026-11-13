@@ -8,6 +8,8 @@
  * applied at once — there is no second confirmation.
  */
 const DIALOG_TIMEOUT_MS = 5 * 60 * 1000;
+/** A dialog that settles faster than this never really opened. */
+const INSTANT_CANCEL_MS = 250;
 
 const errorText = (error) => (error instanceof Error ? error.message : String(error));
 const fail = (text) => ({ kind: 'error', text: text || '操作失败' });
@@ -91,6 +93,7 @@ export function createCommands({ runtime, dialogs, logger }) {
     const service = dialogService();
     if (service?.select) {
       let choice;
+      const opened = Date.now();
       try {
         choice = await service.select({
           title: '回退到哪条消息之前？',
@@ -100,14 +103,22 @@ export function createCommands({ runtime, dialogs, logger }) {
             description: `第 ${targets.length - index} 近的一条消息`,
           })),
           // Deliberately no `signal`: a command signal that is already aborted
-          // would settle the dialog instantly with "cancelled" and the command
-          // would look like it did nothing.
+          // settles the dialog instantly with "cancelled" and the command would
+          // look like it did nothing.
           timeoutMs: DIALOG_TIMEOUT_MS,
         });
       } catch (error) {
-        return fail(errorText(error));
+        note(`/undo 选择框失败：${errorText(error)}`);
+        return fail(`${errorText(error)}\n\n${listing(targets)}`);
       }
-      if (choice === undefined || choice === null) return cancelled(targets);
+      if (choice === undefined || choice === null) {
+        // Nothing was chosen. A dialog that never really opened (an aborted
+        // command signal, a screen without dialog chrome) settles in the same
+        // tick; fall back to the text list so the command is never silent.
+        note('/undo 选择框没有返回结果');
+        if (Date.now() - opened < INSTANT_CANCEL_MS) return { kind: 'success', text: listing(targets) };
+        return cancelled(targets);
+      }
       const target = targets[Number.parseInt(choice, 10) - 1];
       if (!target) return fail('这条消息已经不在当前对话中');
       return apply(invocation.agent, target);
