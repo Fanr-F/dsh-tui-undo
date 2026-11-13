@@ -185,15 +185,39 @@ export function createCommands({ runtime, dialogs, logger, log }) {
       };
     }
     const time = new Date(last.at ?? Date.now()).toLocaleString('zh-CN');
+    const surface = last.surface ?? null;
+    const incoming = last.incoming ?? null;
     const lines = [
-      `最近一次提交给模型的内容（${time}，回合 ${last.turn ?? '?'}，会话 seq ${last.seq ?? '?'}）：`,
-      `共 ${last.count} 条消息、${last.chars} 字符；完整 JSONL：${path}`,
+      `最近一次提交前的上下文（${time}，回合 ${last.turn ?? '?'}，会话 seq ${last.seq ?? '?'}）：`,
+      `模型可见的对话（surface）：${surface?.count ?? '—'} 条 / ${surface?.chars ?? '—'} 字符；本次新增输入：${incoming?.count ?? '—'} 条`,
+      `共 ${last.count} 条、${last.chars} 字符；完整 JSONL：${path}`,
       '',
-      ...last.messages
-        .slice(0, 12)
-        .map((message, index) => `${index + 1}. [${message.role}] ${short(message.text, 120) || '（空）'}`),
     ];
-    if (last.messages.length > 12) lines.push(`… 另有 ${last.messages.length - 12} 条，见文件`);
+    if (surface && surface.messages.length > 0) {
+      lines.push('—— 模型当前可见的对话 ——');
+      lines.push(
+        ...surface.messages
+          .slice(0, 12)
+          .map((message, index) => `${index + 1}. [${message.role}] ${short(message.text, 100) || '（空）'}`),
+      );
+      if (surface.messages.length > 12) lines.push(`… 另有 ${surface.messages.length - 12} 条，见文件`);
+    }
+    if (incoming && incoming.messages.length > 0) {
+      lines.push('', '—— 本次新增的输入 ——');
+      lines.push(
+        ...incoming.messages
+          .slice(0, 6)
+          .map((message, index) => `${index + 1}. [${message.role}] ${short(message.text, 100) || '（空）'}`),
+      );
+      if (incoming.messages.length > 6) lines.push(`… 另有 ${incoming.messages.length - 6} 条，见文件`);
+    }
+    if (!surface && !incoming) {
+      lines.push(
+        ...last.messages
+          .slice(0, 12)
+          .map((message, index) => `${index + 1}. [${message.role}] ${short(message.text, 100) || '（空）'}`),
+      );
+    }
     return { kind: 'success', text: lines.join('\n') };
   }
 

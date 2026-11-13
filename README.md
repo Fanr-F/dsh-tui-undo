@@ -136,13 +136,18 @@ flush，最后在 `turn/end` 时落最终状态。进程被杀后，下一次 `a
 
 ### 模型输入日志
 
-每次真实步骤的 `agent/pre-step` 会记一份「即将提交给模型的完整消息列表」：
+每次真实步骤的 `agent/pre-step` 会记两段内容：
 
-- 磁盘：`~/.dsh/rewind/context/<session>.jsonl`，一行一次请求，含角色、字符数、每条消息的文本（长文本会截断，默认每条约 8000 字符）；
-- 命令：`/undo-context` 打印最近一次的摘要，并给出文件路径；
-- 开关：`config.contextLog = false` 关闭，`config.contextLimit = <字符数>` 调整截断长度。
+- **surface**：模型当前可见的对话（system / developer / user / assistant / tool，按会话 surface 折叠），撤回改的就是这一段；
+- **incoming**：这一步新增的输入（新用户消息、steer 等）。
 
-撤回后对比两次 `/undo-context` 的输出，就能直接看到模型上下文少了哪几轮。
+落盘位置 `~/.dsh/rewind/context/<session>.jsonl`，一行一次请求，含 `turn`、`seq`、角色序列、字符数和每条消息的文本（长文本默认每条截断到 8000 字符）。
+
+- 命令：`/undo-context` 打印最近一次的 surface 摘要和新增输入，并给出文件路径；
+- 开关：`config.contextLog = false` 关闭，`config.contextLimit = <字符数>` 调整截断长度；
+- 边界：记录的是宿主从会话 surface 折叠出的对话；**工具 schema、provider 层追加的系统提示不在这里**（要看得从 LLM 适配器层加钩子）。
+
+撤回后对比两次 `/undo-context` 的 surface 列表，就能直接看到模型上下文少了哪几轮。
 
 ## 兼容性
 

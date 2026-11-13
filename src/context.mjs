@@ -101,6 +101,34 @@ export function describeInput(messages, { limit = DEFAULT_LIMIT } = {}) {
   };
 }
 
+/** The role a surface item contributes to the model input. */
+const ROLE_BY_TYPE = {
+  'system/message': 'system',
+  'developer/message': 'developer',
+  'user/message': 'user',
+  'assistant/message': 'assistant',
+  'tool/result': 'tool',
+};
+
+/**
+ * Describe the conversation a session currently presents to the model.
+ *
+ * `items` are the surface items `history.itemsOf()` folds: this is the part of
+ * the request the host derives from the session log, so it is what an undo
+ * actually rewrites. Tool schemas and provider-level additions are not here.
+ */
+export function describeSurface(items, { limit = DEFAULT_LIMIT } = {}) {
+  const messages = [];
+  for (const item of Array.isArray(items) ? items : []) {
+    const message = item?.data?.message ?? item?.data;
+    if (!message || typeof message !== 'object') continue;
+    const role = typeof message.role === 'string' ? message.role : ROLE_BY_TYPE[item?.type];
+    if (!role) continue;
+    messages.push({ ...message, role });
+  }
+  return describeInput(messages, { limit });
+}
+
 /** A short, single-line preview of a described input for the diagnostic log. */
 export function summarizeInput(described) {
   const head = described.messages.slice(0, 6).map((item) => `${item.role}:${item.chars}`);

@@ -3,11 +3,11 @@ import { join } from 'node:path';
 import { SnapshotService } from './snapshot.mjs';
 import { gitAvailable } from './git.mjs';
 import { StateError, operationId, readState, writeState } from './store.mjs';
-import { beforeSeq, mergeRanges, userTargets } from './history.mjs';
+import { beforeSeq, itemsOf, mergeRanges, userTargets } from './history.mjs';
 import { buildReplay } from './replay.mjs';
 import { plan as filePlan } from './timeline.mjs';
 import { workspaceDirectory } from './paths.mjs';
-import { createContextLog, describeInput, summarizeInput } from './context.mjs';
+import { createContextLog, describeInput, describeSurface, summarizeInput } from './context.mjs';
 import { describeError } from './log.mjs';
 
 /**
@@ -98,10 +98,32 @@ export class RewindRuntime {
    */
   async #recordContext(session, messages, turn) {
     if (!this.#contextLog) return;
-    const described = describeInput(messages, { limit: this.#contextLimit });
-    const entry = { at: Date.now(), turn: turn ?? null, seq: session.seq, ...described };
+    const incoming = describeInput(messages, { limit: this.#contextLimit });
+    let surface = null;
+    try {
+      surface = describeSurface(itemsOf(session), { limit: this.#contextLimit });
+    } catch {
+      // A session without a readable surface still records its step input.
+      surface = null;
+    }
+    const all = [...(surface?.messages ?? []), ...incoming.messages];
+    const entry = {
+      at: Date.now(),
+      turn: turn ?? null,
+      seq: session.seq,
+      count: all.length,
+      chars: all.reduce((total, item) => total + item.chars, 0),
+      roles: all.map((item) => item.role),
+      surface,
+      incoming,
+      messages: all,
+    };
     await this.#contextLog.write(session.id, entry);
-    this.#trace('context', summarizeInput(described), { turn });
+    this.#trace('context', summarizeInput({ count: all.length, chars: entry.chars, messages: all }), {
+      turn,
+      surface: surface?.count ?? 0,
+      incoming: incoming.count,
+    });
   }
 
   /** `agent/pre-step`: capture for a live step, or rewrite from a maintenance turn. */

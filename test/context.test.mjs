@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createContextLog, describeInput, describeMessage } from '../src/context.mjs';
+import { createContextLog, describeInput, describeMessage, describeSurface } from '../src/context.mjs';
 
 const message = (role, text) => ({ role, content: [{ type: 'text', text }] });
 
@@ -24,6 +24,22 @@ test('describeInput keeps roles, character counts and a clipped body', () => {
   assert.match(described.messages[3].text, /ok/);
   assert.equal(described.chars, described.messages.reduce((total, item) => total + item.chars, 0));
   assert.equal(describeMessage({ role: 'user', content: 'abcdefghij' }, { limit: 5 }).text, 'abcd…');
+});
+
+test('describeSurface maps the surface conversation to model roles', () => {
+  const described = describeSurface(
+    [
+      { type: 'system/message', data: { message: { role: 'system', content: [{ type: 'text', text: 'sys' }] } } },
+      { type: 'user/message', data: { role: 'user', content: [{ type: 'text', text: 'hi' }] } },
+      { type: 'developer/message', data: { message: { content: [{ type: 'text', text: 'dev' }] } } },
+      { type: 'tool/result', data: { message: { role: 'tool', content: [{ type: 'tool-result', content: 'ok' }] } } },
+      { type: 'step/start', data: {} },
+    ],
+    { limit: 100 },
+  );
+  assert.deepEqual(described.roles, ['system', 'user', 'developer', 'tool']);
+  assert.equal(described.count, 4, 'non-message surface rows are ignored');
+  assert.match(described.messages[3].text, /ok/);
 });
 
 test('describeMessage accepts string content and missing content', () => {
